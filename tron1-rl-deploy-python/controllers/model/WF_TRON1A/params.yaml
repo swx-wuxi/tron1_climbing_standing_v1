@@ -1,0 +1,103 @@
+PointfootCfg:
+  loop_frequency: 500
+  joint_names:
+    - "abad_L_Joint"
+    - "hip_L_Joint"
+    - "knee_L_Joint"
+    - "wheel_L_Joint"
+    - "abad_R_Joint"
+    - "hip_R_Joint"
+    - "knee_R_Joint"
+    - "wheel_R_Joint"
+
+  init_state:
+    default_joint_angle:
+      abad_L_Joint: 0.0
+      hip_L_Joint: 0.12
+      knee_L_Joint: 0.635
+      wheel_L_Joint: 0.0
+      abad_R_Joint: 0.0
+      hip_R_Joint: -0.12
+      knee_R_Joint: -0.635
+      wheel_R_Joint: 0.0
+
+  control:
+    stiffness: 42.0
+    damping: 2.5
+    wheel_joint_damping: 1.2
+    wheel_joint_torque_limit: 40
+    action_scale_pos: 0.25
+    action_scale_vel: 0.5
+    decimation: 10
+    user_torque_limit: 80
+
+  normalization:
+    clip_scales:
+      clip_observations: 100.0
+      clip_actions: 100.0
+    obs_scales:
+      lin_vel: 2.0
+      ang_vel: 0.25
+      dof_pos: 1.0
+      dof_vel: 0.05
+
+  size:
+    actions_size: 8
+    observations_size: 28
+    commands_size: 3
+    obs_history_length: 10
+    jointpos_idxs: [0, 1, 2, 4, 5, 6]
+    encoder_output_size: 3
+
+  # Merge under PointfootCfg. This is a partial YAML block, not a replacement file.
+  stand_mode:
+    kneel_hold_duration: 0.20
+    support_pitch_deg: 20.0
+    target_pitch_deg: 7.5
+
+    balance_kp: 4.0
+    balance_kd: 0.6
+    balance_direction: 1.0
+    left_wheel_sign: 1.0
+    right_wheel_sign: 1.0
+    max_balance_wheel_speed: 3.0
+    balance_wheel_accel_limit: 10.0
+
+    fsm:
+      prepare_duration: 0.30
+      shift_duration: 0.60
+      lift_duration: 5.00
+      support_fraction: 0.55
+      knee_delay_fraction: 0.0
+
+      # Continue extending from the knee-supported pose, then hand directly to RL.
+      knee_release_duration: 5.00
+      knee_release_timeout: 6.00
+      rl_handoff_knee_angle: 1.20
+
+      low_stiffness: 24.0
+      low_damping: 2.5
+      hip_pitch_kp: 0.0
+      hip_pitch_kd: 0.0
+      max_hip_compensation: 0.0
+      roll_knee_kp: 0.08
+      roll_knee_kd: 0.02
+      roll_compensation_direction: 1.0
+      max_roll_compensation: 0.10
+
+      wheel_position_kp: 0.35
+      wheel_travel_limit: 4.0
+      max_joint_speed: 6.0
+      max_tracking_error: 0.75
+      abort_stiffness: 8.0
+      abort_damping: 3.0
+
+  imu_orientation_offset:
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
+
+  user_cmd_scales:
+    lin_vel_x: 2.0
+    lin_vel_y: 2.0
+    ang_vel_yaw: 0.25

@@ -1,0 +1,47 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.env
+.venv/
+venv/
+conda/
+
+# Training logs
+logs/
+runs/
+wandb/
+checkpoints/
+models/
+*.pt
+*.pth
+*.onnx
+
+# Videos and large media
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.wmv
+
+# ROS / simulation data
+*.bag
+*.db3
+
+# IDE
+.vscode/
+.idea/
+
+# Build files
+build/
+dist/
+*.egg-info/
+
+# System files
+.DS_Store
+Thumbs.db
