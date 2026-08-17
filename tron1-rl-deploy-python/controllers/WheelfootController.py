@@ -677,17 +677,18 @@ class WheelfootController:
         dt = 1.0 / self.loop_frequency
         self.robot_state_tmp = copy.deepcopy(self.robot_state)
         self.imu_data_tmp = copy.deepcopy(self.imu_data)
-        roll, pitch, _, _, _ = self.get_full_orientation_state()
+        roll, pitch, roll_rate, pitch_rate, _ = self.get_full_orientation_state()
 
         if self.mode == "ABORT_HOLD":
             self.handle_abort_hold()
             return
 
-        # 1) Stabilize the measured kneeling pose before moving anything.
         if self.mode == "PREPARE_SUPPORT":
             self.apply_fsm_commands(
-                self.stand_start_q, self.stand_start_pitch,
-                self.fsm_low_stiffness, self.fsm_low_damping,
+                self.stand_start_q,
+                self.stand_start_pitch,
+                self.fsm_low_stiffness,
+                self.fsm_low_damping,
                 enable_feedback=True
             )
             reason = self.standup_safety_reason(self.stand_start_pitch)
@@ -696,15 +697,21 @@ class WheelfootController:
             elif self.phase_timer >= self.prepare_duration:
                 self.transition_standup_phase("SHIFT_CENTER_OF_MASS")
 
-        # 2) Shift support geometry first. Hip/knee nominally remain kneeling.
         elif self.mode == "SHIFT_CENTER_OF_MASS":
             progress = self.phase_timer / max(self.shift_duration, 1e-6)
             target = self.build_shift_target(progress)
-            pitch_target = self.continuous_standup_pitch_target(self.phase_timer)
+            pitch_target = self.continuous_standup_pitch_target(
+                self.phase_timer
+            )
             self.apply_fsm_commands(
-                target, pitch_target,
-                min(self.control_cfg['stiffness'], self.fsm_low_stiffness * 1.4),
-                self.control_cfg['damping'], enable_feedback=True
+                target,
+                pitch_target,
+                min(
+                    self.control_cfg['stiffness'],
+                    self.fsm_low_stiffness * 1.4
+                ),
+                self.control_cfg['damping'],
+                enable_feedback=True
             )
             reason = self.standup_safety_reason(pitch_target)
             if reason:
@@ -712,7 +719,6 @@ class WheelfootController:
             elif self.phase_timer >= self.shift_duration:
                 self.transition_standup_phase("KNEE_RELEASE")
 
-        # 3) Only now execute the actual standing leg trajectory.
         elif self.mode == "LIFT_BODY":
             progress = self.phase_timer / max(self.lift_duration, 1e-6)
             target = self.build_lift_target(progress)
@@ -720,8 +726,10 @@ class WheelfootController:
                 self.shift_duration + self.phase_timer
             )
             self.apply_fsm_commands(
-                target, pitch_target,
-                self.control_cfg['stiffness'], self.control_cfg['damping'],
+                target,
+                pitch_target,
+                self.control_cfg['stiffness'],
+                self.control_cfg['damping'],
                 enable_feedback=True
             )
             reason = self.standup_safety_reason(pitch_target)
@@ -730,35 +738,83 @@ class WheelfootController:
             elif self.phase_timer >= self.lift_duration:
                 self.transition_standup_phase("STAND_HOLD")
 
-        # 4) Continue extending while knee support is unloaded. RL takes over early,
-        # before the hard-coded controller reaches the unstable two-wheel endpoint.
         elif self.mode == "KNEE_RELEASE":
-            progress = self.phase_timer / max(self.knee_release_duration, 1e-6)
+            progress = self.phase_timer / max(
+                self.knee_release_duration, 1e-6
+            )
             target = self.build_knee_release_target(progress)
             pitch_blend = self.quintic_blend(progress)
-            # Interpolate from the measured phase-entry pitch to the nominal balance pitch.
             pitch_target = (
                 self.knee_release_start_pitch * (1.0 - pitch_blend)
                 + np.radians(self.balance_target_pitch_deg) * pitch_blend
             )
+
             self.apply_fsm_commands(
-                target, pitch_target,
-                self.control_cfg['stiffness'], self.control_cfg['damping'],
-               enable_feedback=True
+                target,
+                pitch_target,
+                self.control_cfg['stiffness'],
+                self.control_cfg['damping'],
+                enable_feedback=True
             )
+
             if self.knee_handoff_ready():
+                fsm_q = np.asarray(
+                    self.robot_cmd.q, dtype=float
+                )[:self.joint_num].copy()
+                fsm_dq = np.asarray(
+                    self.robot_cmd.dq, dtype=float
+                )[:self.joint_num].copy()
+
+                handoff_q = np.asarray(
+                    self.robot_state_tmp.q, dtype=float
+                )[:self.joint_num].copy()
+
                 self.begin_rl_direct()
                 self.handle_walk_mode()
-            elif self.phase_timer >= self.knee_release_timeout:
-               self.transition_standup_phase(
-                   "ABORT_HOLD", "RL handoff knee angle not reached"
+
+                rl_q = np.asarray(
+                    self.robot_cmd.q, dtype=float
+                )[:self.joint_num].copy()
+                rl_dq = np.asarray(
+                    self.robot_cmd.dq, dtype=float
+                )[:self.joint_num].copy()
+
+                wheels = self.get_wheel_indices()
+                legs = self.get_leg_indices()
+                knee_l = self.joint_names.index('knee_L_Joint')
+                knee_r = self.joint_names.index('knee_R_Joint')
+                max_leg_jump = float(np.max(
+                    np.abs(rl_q[legs] - fsm_q[legs])
+                ))
+
+                print(
+                    "RL_HANDOFF | "
+                    f"progress={progress:.3f} | "
+                    f"pitch={np.degrees(pitch):+.1f}deg | "
+                    f"pitch_target={np.degrees(pitch_target):+.1f}deg | "
+                    f"pitch_rate={pitch_rate:+.3f}rad/s | "
+                    f"roll={np.degrees(roll):+.1f}deg | "
+                    f"roll_rate={roll_rate:+.3f}rad/s | "
+                    f"knees=[{handoff_q[knee_l]:+.3f},"
+                    f"{handoff_q[knee_r]:+.3f}] | "
+                    f"fsm_wheel=[{fsm_dq[wheels[0]]:+.3f},"
+                    f"{fsm_dq[wheels[1]]:+.3f}] | "
+                    f"rl_wheel=[{rl_dq[wheels[0]]:+.3f},"
+                    f"{rl_dq[wheels[1]]:+.3f}] | "
+                    f"max_leg_q_jump={max_leg_jump:.3f}"
                 )
 
-        # Diagnostic fallback; normal direct-RL flow does not enter this state.
+            elif self.phase_timer >= self.knee_release_timeout:
+                self.transition_standup_phase(
+                    "ABORT_HOLD",
+                    "RL handoff knee angle not reached"
+                )
+
         period = max(1, int(self.loop_frequency * 0.5))
         q_now = np.asarray(self.robot_state_tmp.q, dtype=float)
         knee_l = self.joint_names.index('knee_L_Joint')
         knee_r = self.joint_names.index('knee_R_Joint')
+
         if self.loop_count % period == 0:
             print(
                 f"FSM={self.mode}, t={self.phase_timer:.2f}s, "
@@ -777,6 +833,7 @@ class WheelfootController:
         self.rl_blend_start_q = np.asarray(
             self.robot_state_tmp.q, dtype=float
         )[:self.joint_num].copy()
+
         self.phase_timer = 0.0
         self.balance_wheel_velocity = 0.0
         self.commands.fill(0.0)
@@ -784,8 +841,7 @@ class WheelfootController:
         self.last_actions.fill(0.0)
         self.encoder_out.fill(0.0)
         self.is_first_rec_obs = True
-        # update() increments loop_count after this call; use -1 so the first
-        # RL_BLEND frame sees loop_count == 0 and evaluates the policy immediately.
+
         self.loop_count = -1
         self.mode = "RL_BLEND"
         print("STAND_UP -> RL_BLEND (zero command)")
@@ -795,21 +851,28 @@ class WheelfootController:
         dt = 1.0 / self.loop_frequency
         self.commands.fill(0.0)
 
-        # Original WALK code computes the exact policy/motor command that worked on stairs.
         self.handle_walk_mode()
         policy_q = np.asarray(self.robot_cmd.q, dtype=float).copy()
         policy_dq = np.asarray(self.robot_cmd.dq, dtype=float).copy()
 
         t = float(np.clip(
-            self.phase_timer / max(self.s2s_rl_blend_duration, 1e-6), 0.0, 1.0
+            self.phase_timer / max(
+                self.s2s_rl_blend_duration, 1e-6
+            ),
+            0.0,
+            1.0
         ))
         alpha = self.smoothstep(t)
 
         for i in range(self.joint_num):
             if (i + 1) % 4 == 0:
-                # No second balance controller here: RL wheel velocity ramps in from zero.
                 self.set_joint_command(
-                    i, 0, alpha * policy_dq[i], 0, 0, self.wheel_joint_damping
+                    i,
+                    0,
+                    alpha * policy_dq[i],
+                    0,
+                    0,
+                    self.wheel_joint_damping
                 )
             else:
                 q_des = (
@@ -817,16 +880,21 @@ class WheelfootController:
                     + alpha * policy_q[i]
                 )
                 self.set_joint_command(
-                    i, q_des, 0, 0,
-                    self.control_cfg['stiffness'], self.control_cfg['damping']
+                    i,
+                    q_des,
+                    0,
+                    0,
+                    self.control_cfg['stiffness'],
+                    self.control_cfg['damping']
                 )
 
         period = max(1, int(self.loop_frequency * 0.25))
         if self.loop_count % period == 0:
             pitch, pitch_rate = self.get_pitch_state()
             print(
-                f"RL_BLEND {100.0*alpha:5.1f}% | "
-                f"pitch={np.degrees(pitch):6.1f} deg | rate={pitch_rate:5.2f}"
+                f"RL_BLEND {100.0 * alpha:5.1f}% | "
+                f"pitch={np.degrees(pitch):6.1f} deg | "
+                f"rate={pitch_rate:5.2f}"
             )
 
         self.phase_timer += dt
@@ -1137,5 +1205,6 @@ class WheelfootController:
     def robot_diagnostic_callback(self, diagnostic_value: datatypes.DiagnosticValue):
       # Check if the received diagnostic data is related to calibration.
       if diagnostic_value.name == "calibration":
+        print("=====0817 night debug ======")
         print(f"Calibration state: {diagnostic_value.code}")
         self.calibration_state = diagnostic_value.code
