@@ -19,7 +19,7 @@ class WheelfootController:
         self.robot = robot
         self.robot_type = robot_type
         self.rl_type = rl_type
-        print("======")
+        print("=== MY TRON1 STANDINGUP TEST 0818——1 ===")
         # Load configuration and model file paths based on robot type
         self.config_file = f'{model_dir}/{self.robot_type}/params.yaml'
         self.model_policy = f'{model_dir}/{self.robot_type}/policy/{self.rl_type}/policy.onnx'
@@ -510,25 +510,186 @@ class WheelfootController:
             print(f"Stand-up phase: {old_mode} -> {new_mode}")
 
     def begin_rl_direct(self):
-            """Start the existing zero-command RL controller without RL_BLEND."""
-            self.commands.fill(0.0)
-            self.actions.fill(0.0)
-            self.last_actions.fill(0.0)
-            self.encoder_out.fill(0.0)
-            self.proprio_history_vector.fill(0.0)
-            self.is_first_rec_obs = True
-            # Force policy evaluation on this control frame.
-            self.loop_count = 0
-            self.phase_timer = 0.0
-            self.balance_wheel_velocity = 0.0
-            self.mode = "WALK"
-            print("KNEE_RELEASE -> WALK: direct zero-command RL handoff")
+        """Start the existing RL controller and initialize position holding."""
+        self.rl_hold_anchor = self.get_wheel_displacement()
+        self.rl_hold_command_x = 0.0
+        self.rl_hold_last_output = 0.0
+        self.rl_hold_user_active = False
+
+        self.commands.fill(0.0)
+        self.actions.fill(0.0)
+        self.last_actions.fill(0.0)
+        self.encoder_out.fill(0.0)
+        self.proprio_history_vector.fill(0.0)
+        self.is_first_rec_obs = True
+        # Force policy evaluation on this control frame.
+        self.loop_count = 0
+        self.phase_timer = 0.0
+        self.balance_wheel_velocity = 0.0
+        self.mode = "WALK"
+        print("KNEE_RELEASE -> WALK: direct zero-command RL handoff")
+
+    ########### 在机器人已经“足够稳定、但还没完全走到硬编码末端”时，把控制权交给 RL。########
+
+    # 这样少走了一段后期 KNEE_RELEASE，轮子不用继续为了把 pitch 拉到更低而滚动，
+    # 所以wheel displacement / 漂移自然会减小。
+    def rl_early_handoff_ready(self, knee_angle):
+        """Accept RL only in the tested low-rate terminal window."""
+        pitch, pitch_rate = self.get_pitch_state()
+
+        early_knee_limit = self.rl_handoff_knee_angle + 0.16  # 增加提前接管的窗口
+        early_pitch_min = self.stand_handoff_pitch + np.radians(10.0)
+        early_pitch_max = self.stand_handoff_pitch + np.radians(18.0)
+
+        ready = (
+            knee_angle <= early_knee_limit
+            and early_pitch_min <= pitch <= early_pitch_max
+            and abs(pitch_rate) <= 0.70
+        )
+
+        if ready:
+            print(
+                "RL_EARLY_HANDOFF | "
+                f"pitch={np.degrees(pitch):+.1f}deg | "
+                f"pitch_rate={pitch_rate:+.3f}rad/s | "
+                f"knee_max={knee_angle:.3f}rad"
+            )
+        return ready
 
     def knee_handoff_ready(self):
-        q = np.asarray(self.robot_state_tmp.q, dtype=float)[:self.joint_num]
-        knee_l = self.joint_names.index('knee_L_Joint')
-        knee_r = self.joint_names.index('knee_R_Joint')
-        return max(abs(q[knee_l]), abs(q[knee_r])) <= self.rl_handoff_knee_angle
+        q = np.asarray(
+            self.robot_state_tmp.q,
+            dtype=float
+        )[:self.joint_num]
+
+        knee_l = self.joint_names.index("knee_L_Joint")
+        knee_r = self.joint_names.index("knee_R_Joint")
+        knee_angle = max(abs(q[knee_l]), abs(q[knee_r]))
+
+        # 原 MuJoCo baseline 是无条件兜底：
+        # 新窗口不满足时，仍按原来的 1.20 rad 条件接管，
+        # 因此绝不会比 baseline 更晚接管。
+        if knee_angle <= self.rl_handoff_knee_angle:
+            return True
+
+        return self.rl_early_handoff_ready(knee_angle)
+
+    def update_station_hold_command(self):
+        """Use a strong short catch command, then fade to weak position holding."""
+        displacement = self.get_wheel_displacement()
+
+        if not np.isfinite(displacement):
+            return
+
+        # Distinguish a real joystick update from our previous automatic output.
+        received_linear = float(self.commands[0])
+        received_yaw = float(self.commands[2])
+
+        new_user_input = (
+            abs(received_yaw) > 0.03
+            or (
+                abs(received_linear) > 0.03
+                and abs(
+                    received_linear - self.rl_hold_last_output
+                ) > 0.03
+            )
+        )
+
+        if new_user_input:
+            self.rl_hold_user_active = True
+
+        # A real joystick command always has priority.
+        if self.rl_hold_user_active:
+            if (
+                abs(received_linear) <= 0.03
+                and abs(received_yaw) <= 0.03
+            ):
+                # Joystick returned to neutral: hold the new position.
+                self.rl_hold_user_active = False
+                self.rl_hold_anchor = displacement
+                self.rl_hold_command_x = 0.0
+                self.rl_hold_last_output = 0.0
+            else:
+                self.rl_hold_anchor = displacement
+                self.rl_hold_command_x = 0.0
+                self.rl_hold_last_output = received_linear
+                return
+
+        dq = np.asarray(
+            self.robot_state_tmp.dq,
+            dtype=float,
+        )[:self.joint_num]
+
+        wheel_indices = self.get_wheel_indices()
+        wheel_rate = float(np.mean(dq[wheel_indices]))
+
+        # MuJoCo wheel collision radius.
+        wheel_radius = 0.127
+
+        position_error = wheel_radius * (
+            displacement - self.rl_hold_anchor
+        )
+        velocity = wheel_radius * wheel_rate
+
+        elapsed = self.loop_count / self.loop_frequency
+
+        # Strong catch for the first 1.5 s. Fade to weak holding by 2.5 s.
+        schedule_u = float(np.clip(
+            (elapsed - 1.5) / 1.0,
+            0.0,
+            1.0,
+        ))
+        weak_weight = (
+            schedule_u
+            * schedule_u
+            * (3.0 - 2.0 * schedule_u)
+        )
+
+        kp = (
+            2.0 * (1.0 - weak_weight)
+            + 0.20 * weak_weight
+        )
+        kd = (
+            0.20 * (1.0 - weak_weight)
+            + 0.10 * weak_weight
+        )
+        command_limit = (
+            0.50 * (1.0 - weak_weight)
+            + 0.10 * weak_weight
+        )
+        accel_limit = (
+            8.0 * (1.0 - weak_weight)
+            + 0.80 * weak_weight
+        )
+
+        target = float(np.clip(
+            -kp * position_error - kd * velocity,
+            -command_limit,
+            command_limit,
+        ))
+
+        max_step = accel_limit / self.loop_frequency
+        self.rl_hold_command_x += float(np.clip(
+            target - self.rl_hold_command_x,
+            -max_step,
+            max_step,
+        ))
+
+        self.commands[0] = self.rl_hold_command_x
+        self.rl_hold_last_output = self.rl_hold_command_x
+
+        period = max(
+            1,
+            int(self.loop_frequency * 0.5),
+        )
+        if self.loop_count % period == 0:
+            print(
+                "STATION_HOLD | "
+                f"dx={position_error:+.3f}m | "
+                f"v={velocity:+.3f}m/s | "
+                f"cmd_x={self.rl_hold_command_x:+.3f}m/s"
+            )
+    ##################################################################################
     
     def fsm_wheel_commands(self, target_pitch_rad):
         """Pitch feedback plus wheel-position anchor, copied from the useful stand-up idea."""
@@ -565,6 +726,7 @@ class WheelfootController:
             self.transition_standup_phase("ABORT_HOLD", "invalid IMU orientation")
             return
 
+        # 加入各个关节的反馈
         if enable_feedback:
             pitch_error = pitch - pitch_target_rad
             hip_comp = np.clip(
@@ -672,6 +834,7 @@ class WheelfootController:
                     self.abort_stiffness, self.abort_damping
                 )
 
+    ######################## 核心FSM起立函数（硬编码）#########################
     def handle_standup_fsm(self):
         """Fixed kneel -> prepare support -> shift COM -> lift -> hold stand."""
         dt = 1.0 / self.loop_frequency
@@ -827,6 +990,7 @@ class WheelfootController:
         if self.mode not in {"ABORT_HOLD", "STAND_HOLD"}:
             self.phase_timer += dt
 
+    ##################################################################################
     def begin_rl_blend(self):
         """Reset recurrent/history state and start a zero-command RL handoff."""
         self.robot_state_tmp = copy.deepcopy(self.robot_state)
@@ -905,60 +1069,122 @@ class WheelfootController:
 
     # Handle the walk mode where the robot moves based on computed actions
     def handle_walk_mode(self):
-        # Update the temporary robot state and IMU data
         self.robot_state_tmp = copy.deepcopy(self.robot_state)
         self.imu_data_tmp = copy.deepcopy(self.imu_data)
 
-        # Execute actions every 'decimation' iterations
-        if self.loop_count % self.control_cfg['decimation'] == 0:
+        # Update command before observation/policy inference.
+        # RL actions and actuator commands remain unchanged.
+        self.update_station_hold_command()
+
+        if self.loop_count % self.control_cfg["decimation"] == 0:
             self.compute_observation()
             self.compute_encoder()
             self.compute_actions()
-            # Clip the actions within predefined limits
-            action_min = -self.rl_cfg['clip_scales']['clip_actions']
-            action_max = self.rl_cfg['clip_scales']['clip_actions']
-            self.actions = np.clip(self.actions, action_min, action_max)
 
-            # swap actions positions back to deep first, only when action updated
+            action_min = -self.rl_cfg[
+                "clip_scales"
+            ]["clip_actions"]
+            action_max = self.rl_cfg[
+                "clip_scales"
+            ]["clip_actions"]
+
+            self.actions = np.clip(
+                self.actions,
+                action_min,
+                action_max,
+            )
+
             if self.rl_type == "isaaclab":
-                self.actions = self.swap_positions(self.actions, reverse=True)
+                self.actions = self.swap_positions(
+                    self.actions,
+                    reverse=True,
+                )
 
-            # Training observations contain the raw previous policy action,
-            # before deployment-only torque safety limiting below.
             self.last_actions = self.actions.copy()
 
-        # Iterate over the joints and set commands based on actions
         joint_pos = np.array(self.robot_state_tmp.q)
         joint_vel = np.array(self.robot_state_tmp.dq)
 
         for i in range(len(joint_pos)):
             if (i + 1) % 4 != 0:
-                # Compute the limits for the action based on joint position and velocity
-                action_min = (joint_pos[i] - self.init_joint_angles[i] +
-                              (self.control_cfg['damping'] * joint_vel[i] - self.control_cfg['user_torque_limit']) /
-                              self.control_cfg['stiffness'])
-                action_max = (joint_pos[i] - self.init_joint_angles[i] +
-                              (self.control_cfg['damping'] * joint_vel[i] + self.control_cfg['user_torque_limit']) /
-                              self.control_cfg['stiffness'])
+                action_min = (
+                    joint_pos[i]
+                    - self.init_joint_angles[i]
+                    + (
+                        self.control_cfg["damping"]
+                        * joint_vel[i]
+                        - self.control_cfg["user_torque_limit"]
+                    )
+                    / self.control_cfg["stiffness"]
+                )
 
-                # Clip action within limits
-                self.actions[i] = max(action_min / self.control_cfg['action_scale_pos'],
-                                      min(action_max / self.control_cfg['action_scale_pos'], self.actions[i]))
+                action_max = (
+                    joint_pos[i]
+                    - self.init_joint_angles[i]
+                    + (
+                        self.control_cfg["damping"]
+                        * joint_vel[i]
+                        + self.control_cfg["user_torque_limit"]
+                    )
+                    / self.control_cfg["stiffness"]
+                )
 
-                # Compute the desired joint position and set it
-                pos_des = self.actions[i] * self.control_cfg['action_scale_pos'] + self.init_joint_angles[i]
-                self.set_joint_command(i, pos_des, 0, 0, self.control_cfg['stiffness'], self.control_cfg['damping'])
+                self.actions[i] = max(
+                    action_min
+                    / self.control_cfg["action_scale_pos"],
+                    min(
+                        action_max
+                        / self.control_cfg["action_scale_pos"],
+                        self.actions[i],
+                    ),
+                )
+
+                pos_des = (
+                    self.actions[i]
+                    * self.control_cfg["action_scale_pos"]
+                    + self.init_joint_angles[i]
+                )
+
+                self.set_joint_command(
+                    i,
+                    pos_des,
+                    0,
+                    0,
+                    self.control_cfg["stiffness"],
+                    self.control_cfg["damping"],
+                )
 
             else:
                 action_min = (
-                    joint_vel[i] - self.wheel_joint_torque_limit / self.wheel_joint_damping
-                ) / self.control_cfg['action_scale_vel']
+                    joint_vel[i]
+                    - self.wheel_joint_torque_limit
+                    / self.wheel_joint_damping
+                ) / self.control_cfg["action_scale_vel"]
+
                 action_max = (
-                    joint_vel[i] + self.wheel_joint_torque_limit / self.wheel_joint_damping
-                ) / self.control_cfg['action_scale_vel']
-                self.actions[i] = max(action_min, min(action_max, self.actions[i]))
-                velocity_des = self.actions[i] * self.control_cfg['action_scale_vel']
-                self.set_joint_command(i, 0, velocity_des, 0, 0, self.wheel_joint_damping)
+                    joint_vel[i]
+                    + self.wheel_joint_torque_limit
+                    / self.wheel_joint_damping
+                ) / self.control_cfg["action_scale_vel"]
+
+                self.actions[i] = max(
+                    action_min,
+                    min(action_max, self.actions[i]),
+                )
+
+                velocity_des = (
+                    self.actions[i]
+                    * self.control_cfg["action_scale_vel"]
+                )
+
+                self.set_joint_command(
+                    i,
+                    0,
+                    velocity_des,
+                    0,
+                    0,
+                    self.wheel_joint_damping,
+                )
 
     def swap_positions(self, initial_array, reverse=False, exclude_wheel=False):
         if not exclude_wheel:
@@ -1123,7 +1349,9 @@ class WheelfootController:
         self.robot_cmd.Kp[joint_index] = kp
         self.robot_cmd.Kd[joint_index] = kd
 
+    #******************* 蹲下起立程序入口，整个蹲起的全部顺序****************
     def update(self):
+        "整个程序，机器人运动的入口，每走一步都会从这里面更新"
         """Run S2S only at startup; once WALK is reached, use the original RL path."""
         self.robot_state_tmp = copy.deepcopy(self.robot_state)
         self.imu_data_tmp = copy.deepcopy(self.imu_data)
@@ -1181,7 +1409,7 @@ class WheelfootController:
           self.start_controller = True
 
         # Check if both L1 (button index 4) and X (button index 2) are pressed to stop the controller
-        if self.start_controller and sensor_joy.buttons[4] == 1 and sensor_joy.buttons[2] == 1:
+        if self.start_controller and sensor_joy.buttons[4] == 1 and sensor_joyphase_timer.buttons[2] == 1:
           print(f"L1 + X: stop_controller...")
           self.start_controller = False
 
