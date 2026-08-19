@@ -176,6 +176,9 @@ class WheelfootController:
         self.s2s_balance_max_speed = float(stand_cfg.get('max_balance_wheel_speed', 1.0))
         self.s2s_balance_accel = float(stand_cfg.get('balance_wheel_accel_limit', 4.0))
         self.s2s_rl_blend_duration = float(stand_cfg.get('rl_blend_duration', 1.0))
+        self.rl_handoff_blend_duration = float(
+            stand_cfg.get('rl_handoff_blend_duration', 0.20)
+        )
 
         # ---- Fixed-kneel stand-up FSM parameters ----
         # These are the small subset required by the colleague's stand-up path.
@@ -511,6 +514,17 @@ class WheelfootController:
 
     def begin_rl_direct(self):
         """Start the existing RL controller and initialize position holding."""
+        # Preserve the last command issued by the stand-up FSM.  The policy is
+        # evaluated immediately below, but its targets are introduced smoothly
+        # for a short handoff window instead of creating a q/dq step.
+        self.rl_handoff_start_q = np.asarray(
+            self.robot_cmd.q, dtype=float
+        )[:self.joint_num].copy()
+        self.rl_handoff_start_dq = np.asarray(
+            self.robot_cmd.dq, dtype=float
+        )[:self.joint_num].copy()
+        self.rl_handoff_blend_active = self.rl_handoff_blend_duration > 0.0
+
         self.rl_hold_anchor = self.get_wheel_displacement()
         self.rl_hold_command_x = 0.0
         self.rl_hold_last_output = 0.0
@@ -529,6 +543,45 @@ class WheelfootController:
         self.mode = "WALK"
         print("KNEE_RELEASE -> WALK: direct zero-command RL handoff")
 
+    def apply_rl_handoff_blend(self):
+        """Make the short FSM-to-policy target transition continuous."""
+        if not getattr(self, 'rl_handoff_blend_active', False):
+            return
+
+        # A real operator command must never wait for the startup blend.
+        if self.rl_hold_user_active:
+            self.rl_handoff_blend_active = False
+            return
+
+        elapsed = self.loop_count / self.loop_frequency
+        progress = float(np.clip(
+            elapsed / max(self.rl_handoff_blend_duration, 1e-6),
+            0.0,
+            1.0,
+        ))
+        alpha = self.smoothstep(progress)
+
+        for i in self.get_leg_indices():
+            self.robot_cmd.q[i] = (
+                (1.0 - alpha) * self.rl_handoff_start_q[i]
+                + alpha * self.robot_cmd.q[i]
+            )
+
+        for i in self.get_wheel_indices():
+            applied_dq = (
+                (1.0 - alpha) * self.rl_handoff_start_dq[i]
+                + alpha * self.robot_cmd.dq[i]
+            )
+            self.robot_cmd.dq[i] = applied_dq
+            # The policy history must describe the wheel action that was
+            # actually sent during the blend, not the unblended target.
+            self.last_actions[i] = (
+                applied_dq / self.control_cfg["action_scale_vel"]
+            )
+
+        if progress >= 1.0:
+            self.rl_handoff_blend_active = False
+
     ########### 在机器人已经“足够稳定、但还没完全走到硬编码末端”时，把控制权交给 RL。########
 
     # 这样少走了一段后期 KNEE_RELEASE，轮子不用继续为了把 pitch 拉到更低而滚动，
@@ -538,13 +591,13 @@ class WheelfootController:
         pitch, pitch_rate = self.get_pitch_state()
 
         early_knee_limit = self.rl_handoff_knee_angle + 0.16  # 增加提前接管的窗口
-        early_pitch_min = self.stand_handoff_pitch + np.radians(10.0)
+        early_pitch_min = self.stand_handoff_pitch + np.radians(12.0)
         early_pitch_max = self.stand_handoff_pitch + np.radians(18.0)
 
         ready = (
             knee_angle <= early_knee_limit
             and early_pitch_min <= pitch <= early_pitch_max
-            and abs(pitch_rate) <= 0.70
+            and abs(pitch_rate) <= 0.55
         )
 
         if ready:
@@ -1186,6 +1239,8 @@ class WheelfootController:
                     self.wheel_joint_damping,
                 )
 
+        self.apply_rl_handoff_blend()
+
     def swap_positions(self, initial_array, reverse=False, exclude_wheel=False):
         if not exclude_wheel:
             joint_idx_lab = [0, 4, 1, 5, 2, 6, 3, 7]
@@ -1433,6 +1488,6 @@ class WheelfootController:
     def robot_diagnostic_callback(self, diagnostic_value: datatypes.DiagnosticValue):
       # Check if the received diagnostic data is related to calibration.
       if diagnostic_value.name == "calibration":
-        print("=====0817 night debug ======")
+        print("=====0819-pm debugging ======")
         print(f"Calibration state: {diagnostic_value.code}")
         self.calibration_state = diagnostic_value.code
