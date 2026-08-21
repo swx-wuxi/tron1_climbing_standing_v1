@@ -1461,12 +1461,16 @@ class WheelfootController:
         # Check if the robot is in the calibration state and both L1 (button index 4) and Y (button index 3) buttons are pressed.
         if not self.start_controller and self.calibration_state == 0 and sensor_joy.buttons[4] == 1 and sensor_joy.buttons[3] == 1:
           print(f"L1 + Y: start_controller...")
+          print("=====机器人开始运动======")
           self.start_controller = True
 
         # Check if both L1 (button index 4) and X (button index 2) are pressed to stop the controller
-        if self.start_controller and sensor_joy.buttons[4] == 1 and sensor_joyphase_timer.buttons[2] == 1:
+        if self.start_controller and sensor_joy.buttons[4] == 1 and sensor_joy.buttons[2] == 1:
           print(f"L1 + X: stop_controller...")
+          print("=====机器人停止运动，进入空闲状态======")
+          self.commands.fill(0.0)
           self.start_controller = False
+          return
 
         linear_x  = sensor_joy.axes[1]
         linear_y  = sensor_joy.axes[0]
@@ -1479,7 +1483,7 @@ class WheelfootController:
         # >>> S2S: do not inject a walking command while standing up or blending.
         if self.mode == "WALK":
             self.commands[0] = linear_x * 1.0
-            self.commands[1] = 0.0
+            self.commands[1] = linear_y * 0.0
             self.commands[2] = angular_z * 0.8
         else:
             self.commands[:] = 0.0
@@ -1488,6 +1492,6 @@ class WheelfootController:
     def robot_diagnostic_callback(self, diagnostic_value: datatypes.DiagnosticValue):
       # Check if the received diagnostic data is related to calibration.
       if diagnostic_value.name == "calibration":
-        print("=====0819-pm debugging ======")
+        print("=====0820-am debugging ======")
         print(f"Calibration state: {diagnostic_value.code}")
         self.calibration_state = diagnostic_value.code
