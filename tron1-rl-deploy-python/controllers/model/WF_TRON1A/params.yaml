@@ -64,6 +64,24 @@ PointfootCfg:
     max_balance_wheel_speed: 3.0
     balance_wheel_accel_limit: 10.0
 
+    # Small deployment-side residual used only after zero-command WALK is stable.
+    zero_command_pitch_compensation:
+      enabled: true
+      command_deadband: 0.03
+      min_walk_time: 3.0
+      stable_hold_time: 0.50
+      target_pitch_deg: 3.5
+      target_tolerance_deg: 5.0
+      stable_pitch_rate: 0.20
+      kp: 2.0
+      kd: 0.15
+      pitch_rate_filter_alpha: 0.05
+      correction_limit: 0.50
+      final_wheel_speed_limit: 6.0
+      release_pitch_deg: 12.0
+      release_pitch_rate: 1.0
+      print_interval: 3.0
+
     fsm:
       prepare_duration: 0.30
       shift_duration: 0.60

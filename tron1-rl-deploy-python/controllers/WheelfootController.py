@@ -193,6 +193,51 @@ class WheelfootController:
         self.balance_max_wheel_speed = float(stand_cfg.get('max_balance_wheel_speed', 3.0))
         self.balance_wheel_accel_limit = float(stand_cfg.get('balance_wheel_accel_limit', 10.0))
 
+        # Zero-command WALK pitch compensation.  This is a small residual on
+        # top of the RL wheel target, not a replacement for the policy.
+        pitch_comp_cfg = stand_cfg.get('zero_command_pitch_compensation', {})
+        self.zero_pitch_comp_enabled = bool(pitch_comp_cfg.get('enabled', False))
+        self.zero_pitch_comp_command_deadband = float(
+            pitch_comp_cfg.get('command_deadband', 0.03)
+        )
+        self.zero_pitch_comp_min_walk_time = float(
+            pitch_comp_cfg.get('min_walk_time', 3.0)
+        )
+        self.zero_pitch_comp_target = np.radians(float(
+            pitch_comp_cfg.get('target_pitch_deg', 3.5)
+        ))
+        self.zero_pitch_comp_target_tolerance = np.radians(float(
+            pitch_comp_cfg.get('target_tolerance_deg', 5.0)
+        ))
+        self.zero_pitch_comp_stable_rate = float(
+            pitch_comp_cfg.get('stable_pitch_rate', 0.20)
+        )
+        self.zero_pitch_comp_stable_hold_time = float(
+            pitch_comp_cfg.get('stable_hold_time', 0.50)
+        )
+        self.zero_pitch_comp_kp = float(pitch_comp_cfg.get('kp', 2.0))
+        self.zero_pitch_comp_kd = float(pitch_comp_cfg.get('kd', 0.15))
+        self.zero_pitch_comp_rate_alpha = float(np.clip(
+            pitch_comp_cfg.get('pitch_rate_filter_alpha', 0.05),
+            0.0,
+            1.0,
+        ))
+        self.zero_pitch_comp_correction_limit = abs(float(
+            pitch_comp_cfg.get('correction_limit', 0.50)
+        ))
+        self.zero_pitch_comp_final_speed_limit = abs(float(
+            pitch_comp_cfg.get('final_wheel_speed_limit', 6.0)
+        ))
+        self.zero_pitch_comp_release_pitch = np.radians(float(
+            pitch_comp_cfg.get('release_pitch_deg', 12.0)
+        ))
+        self.zero_pitch_comp_release_rate = abs(float(
+            pitch_comp_cfg.get('release_pitch_rate', 1.0)
+        ))
+        self.zero_pitch_comp_print_interval = float(
+            pitch_comp_cfg.get('print_interval', 3.0)
+        )
+
         self.prepare_duration = float(fsm_cfg.get('prepare_duration', 1.0))
         self.shift_duration = float(fsm_cfg.get('shift_duration', 2.0))
         self.lift_duration = float(fsm_cfg.get('lift_duration', self.s2s_duration))
@@ -247,6 +292,13 @@ class WheelfootController:
         self.stand_percent = 0  # percentage of time the robot has spent in stand mode
         self.policy_session = None  # ONNX model session for policy inference
         self.joint_num = len(self.joint_names)  # number of joints
+
+        # Updated by the joystick callback and consumed only in WALK.
+        self.user_zero_command = True
+        self.zero_pitch_comp_active = False
+        self.zero_pitch_comp_aborted = False
+        self.zero_pitch_comp_stable_count = 0
+        self.zero_pitch_comp_filtered_rate = 0.0
 
         self.joint_pos_idxs = config['PointfootCfg']['size']['jointpos_idxs']
         self.wheel_joint_damping = config['PointfootCfg']['control']['wheel_joint_damping']
@@ -494,6 +546,149 @@ class WheelfootController:
                 self.balance_right_wheel_sign * self.balance_wheel_velocity,
                 pitch, pitch_rate)
 
+    def reset_zero_command_pitch_compensation(self, clear_abort=True):
+        """Reset the residual controller without changing the RL policy state."""
+        self.zero_pitch_comp_active = False
+        self.zero_pitch_comp_stable_count = 0
+        self.zero_pitch_comp_filtered_rate = 0.0
+        if clear_abort:
+            self.zero_pitch_comp_aborted = False
+
+    def apply_zero_command_pitch_compensation(self):
+        """Add a bounded pitch-PD residual to wheel targets after RL handoff.
+
+        The residual is armed only after a neutral joystick command has remained
+        near the standing pitch with a low pitch rate.  A large pitch or rate
+        disables it until the operator moves the joystick or WALK is restarted.
+        """
+        if not self.zero_pitch_comp_enabled:
+            return
+
+        wheel_indices = self.get_wheel_indices()
+        if len(wheel_indices) != 2:
+            return
+
+        if not self.user_zero_command:
+            self.reset_zero_command_pitch_compensation(clear_abort=True)
+            return
+
+        pitch, pitch_rate = self.get_pitch_state()
+        if not np.all(np.isfinite([pitch, pitch_rate])):
+            self.reset_zero_command_pitch_compensation(clear_abort=False)
+            return
+
+        alpha = self.zero_pitch_comp_rate_alpha
+        self.zero_pitch_comp_filtered_rate = (
+            alpha * pitch_rate
+            + (1.0 - alpha) * self.zero_pitch_comp_filtered_rate
+        )
+        filtered_rate = self.zero_pitch_comp_filtered_rate
+        elapsed = self.loop_count / self.loop_frequency
+        handoff_active = getattr(self, 'rl_handoff_blend_active', False)
+
+        if self.zero_pitch_comp_active and (
+            abs(pitch) > self.zero_pitch_comp_release_pitch
+            or abs(filtered_rate) > self.zero_pitch_comp_release_rate
+        ):
+            self.zero_pitch_comp_active = False
+            self.zero_pitch_comp_aborted = True
+            print(
+                "ZERO_CMD_PITCH_COMP safety release | "
+                f"pitch={np.degrees(pitch):+.2f}deg | "
+                f"pitch_rate={filtered_rate:+.3f}rad/s"
+            )
+
+        if not self.zero_pitch_comp_active and not self.zero_pitch_comp_aborted:
+            stable = (
+                elapsed >= self.zero_pitch_comp_min_walk_time
+                and not handoff_active
+                and abs(pitch - self.zero_pitch_comp_target)
+                <= self.zero_pitch_comp_target_tolerance
+                and abs(filtered_rate) <= self.zero_pitch_comp_stable_rate
+            )
+            if stable:
+                self.zero_pitch_comp_stable_count += 1
+            else:
+                self.zero_pitch_comp_stable_count = 0
+
+            required_count = max(
+                1,
+                int(self.zero_pitch_comp_stable_hold_time * self.loop_frequency),
+            )
+            if self.zero_pitch_comp_stable_count >= required_count:
+                self.zero_pitch_comp_active = True
+                print(
+                    "ZERO_CMD_PITCH_COMP armed | "
+                    f"pitch={np.degrees(pitch):+.2f}deg | "
+                    f"pitch_rate={filtered_rate:+.3f}rad/s"
+                )
+
+        policy_wheel_dq = np.asarray(
+            [self.robot_cmd.dq[i] for i in wheel_indices],
+            dtype=float,
+        )
+        correction = 0.0
+
+        if self.zero_pitch_comp_active:
+            pitch_error = pitch - self.zero_pitch_comp_target
+            # Keep the sign convention already validated by the stand-up FSM.
+            correction = self.balance_direction * (
+                self.zero_pitch_comp_kp * pitch_error
+                + self.zero_pitch_comp_kd * filtered_rate
+            )
+            correction = float(np.clip(
+                correction,
+                -self.zero_pitch_comp_correction_limit,
+                self.zero_pitch_comp_correction_limit,
+            ))
+
+            wheel_signs = (
+                self.balance_left_wheel_sign,
+                self.balance_right_wheel_sign,
+            )
+            for index, sign in zip(wheel_indices, wheel_signs):
+                final_dq = self.robot_cmd.dq[index] + sign * correction
+                final_dq = float(np.clip(
+                    final_dq,
+                    -self.zero_pitch_comp_final_speed_limit,
+                    self.zero_pitch_comp_final_speed_limit,
+                ))
+                self.robot_cmd.dq[index] = final_dq
+                # Observation history should contain the target actually sent;
+                # leave self.actions untouched to prevent residual accumulation.
+                self.last_actions[index] = (
+                    final_dq / self.control_cfg['action_scale_vel']
+                )
+
+        print_period = max(
+            1,
+            int(self.zero_pitch_comp_print_interval * self.loop_frequency),
+        )
+        if self.loop_count % print_period == 0:
+            actual_wheel_dq = np.asarray(
+                [self.robot_state_tmp.dq[i] for i in wheel_indices],
+                dtype=float,
+            )
+            sent_wheel_dq = np.asarray(
+                [self.robot_cmd.dq[i] for i in wheel_indices],
+                dtype=float,
+            )
+            state = (
+                "ACTIVE" if self.zero_pitch_comp_active
+                else "ABORT" if self.zero_pitch_comp_aborted
+                else "WAIT"
+            )
+            print(
+                f"ZERO_CMD_PITCH_COMP {state} | "
+                f"pitch={np.degrees(pitch):+.2f}deg | "
+                f"pitch_rate={pitch_rate:+.3f}rad/s | "
+                f"filtered_rate={filtered_rate:+.3f}rad/s | "
+                f"policy_dq={policy_wheel_dq.round(3).tolist()} | "
+                f"correction={correction:+.3f}rad/s | "
+                f"sent_dq={sent_wheel_dq.round(3).tolist()} | "
+                f"actual_dq={actual_wheel_dq.round(3).tolist()}"
+            )
+
     def transition_standup_phase(self, new_mode, reason=""):
         """Every phase starts from the current measured pose, not an old reference."""
         old_mode = self.mode
@@ -540,6 +735,7 @@ class WheelfootController:
         self.loop_count = 0
         self.phase_timer = 0.0
         self.balance_wheel_velocity = 0.0
+        self.reset_zero_command_pitch_compensation(clear_abort=True)
         self.mode = "WALK"
         print("KNEE_RELEASE -> WALK: direct zero-command RL handoff")
 
@@ -733,7 +929,7 @@ class WheelfootController:
 
         period = max(
             1,
-            int(self.loop_frequency * 0.5),
+            int(self.loop_frequency * 3.0),
         )
         if self.loop_count % period == 0:
             print(
@@ -1240,6 +1436,8 @@ class WheelfootController:
                 )
 
         self.apply_rl_handoff_blend()
+        # Final deployment-side residual: RL -> handoff blend -> pitch PD -> send.
+        self.apply_zero_command_pitch_compensation()
 
     def swap_positions(self, initial_array, reverse=False, exclude_wheel=False):
         if not exclude_wheel:
@@ -1479,6 +1677,11 @@ class WheelfootController:
         linear_x  = 1.0 if linear_x > 1.0 else (-1.0 if linear_x < -1.0 else linear_x)
         linear_y  = 1.0 if linear_y > 1.0 else (-1.0 if linear_y < -1.0 else linear_y)
         angular_z = 1.0 if angular_z > 1.0 else (-1.0 if angular_z < -1.0 else angular_z)
+
+        self.user_zero_command = (
+            abs(linear_x) <= self.zero_pitch_comp_command_deadband
+            and abs(angular_z) <= self.zero_pitch_comp_command_deadband
+        )
 
         # >>> S2S: do not inject a walking command while standing up or blending.
         if self.mode == "WALK":
