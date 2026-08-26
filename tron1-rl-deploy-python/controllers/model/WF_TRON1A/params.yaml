@@ -82,6 +82,20 @@ PointfootCfg:
       release_pitch_rate: 1.0
       print_interval: 3.0
 
+    # Direct wheel-odometry hold used only after zero-command WALK is settled.
+    # Nonzero joystick commands (including stair climbing) bypass all limits.
+    zero_command_wheel_hold:
+      enabled: true
+      min_walk_time: 3.0
+      position_kp: 0.20
+      velocity_kd: 0.05
+      yaw_position_kp: 0.30
+      yaw_velocity_kd: 0.08
+      common_correction_limit: 0.10
+      yaw_correction_limit: 0.08
+      correction_accel_limit: 0.50
+      zero_command_speed_limit: 6.0
+
     fsm:
       prepare_duration: 0.30
       shift_duration: 0.60

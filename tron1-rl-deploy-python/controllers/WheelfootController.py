@@ -1,10 +1,13 @@
 import os
 import sys
 import copy
+import csv
+import logging
 import numpy as np
 import yaml
 import time
 import onnxruntime as ort
+from logging.handlers import RotatingFileHandler
 from scipy.spatial.transform import Rotation as R
 from functools import partial
 import limxsdk
@@ -15,11 +18,12 @@ import limxsdk.datatypes as datatypes
 
 class WheelfootController:
     def __init__(self, model_dir, robot, robot_type, rl_type, start_controller):
+        self.setup_file_logger()
         # Initialize robot and type information
         self.robot = robot
         self.robot_type = robot_type
         self.rl_type = rl_type
-        print("=== MY TRON1 STANDINGUP TEST 0818——1 ===")
+        self.logger.info("Controller session started")
         # Load configuration and model file paths based on robot type
         self.config_file = f'{model_dir}/{self.robot_type}/params.yaml'
         self.model_policy = f'{model_dir}/{self.robot_type}/policy/{self.rl_type}/policy.onnx'
@@ -103,6 +107,107 @@ class WheelfootController:
         self.wheel_start_angles = None
         self.fsm_last_leg_target = None
         self.abort_hold_angles = None
+
+        # Policy-frame diagnostics are buffered and written once per second.
+        self.controller_log_interval = 1.0
+        self._walk_log_buffer = []
+        self._last_walk_log_flush_time = None
+        self.last_policy_compute_ms = 0.0
+        self.last_loop_dt_ms = 0.0
+        self._last_update_time = None
+        self.last_robot_state_received_time = 0.0
+        self.last_imu_received_time = 0.0
+        self.last_policy_wheel_dq = np.zeros(2, dtype=float)
+        self.pre_pitch_wheel_dq = np.zeros(2, dtype=float)
+        self.pre_wheel_hold_dq = np.zeros(2, dtype=float)
+        self.zero_pitch_comp_last_correction = 0.0
+        self.setup_diagnostic_csv()
+
+    def setup_file_logger(self):
+        """Create a file-only controller logger without touching stdout."""
+        deploy_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        log_dir = os.environ.get(
+            "WHEELFOOT_LOG_DIR",
+            os.path.join(deploy_root, "logs"),
+        )
+        os.makedirs(log_dir, exist_ok=True)
+        self.controller_log_path = os.path.join(
+            log_dir,
+            "wheelfoot_controller.log",
+        )
+
+        logger = logging.getLogger("tron1.wheelfoot_controller")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.close()
+
+        handler = RotatingFileHandler(
+            self.controller_log_path,
+            maxBytes=20 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d | %(levelname)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logger.addHandler(handler)
+        self.logger = logger
+
+    def setup_diagnostic_csv(self):
+        """Prepare a stable, analysis-friendly CSV schema."""
+        deploy_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        log_dir = os.environ.get(
+            "WHEELFOOT_LOG_DIR",
+            os.path.join(deploy_root, "logs"),
+        )
+        os.makedirs(log_dir, exist_ok=True)
+        self.diagnostic_csv_path = os.path.join(
+            log_dir,
+            "wheelfoot_diagnostic.csv",
+        )
+        self.diagnostic_session = time.strftime("%Y%m%d_%H%M%S")
+        scalar_fields = [
+            "session", "time_monotonic_s", "loop", "loop_dt_ms",
+            "policy_compute_ms", "robot_stamp", "imu_stamp",
+            "state_age_ms", "imu_age_ms", "comp",
+            "pitch_deg", "roll_deg",
+            "gyro_x", "gyro_y", "gyro_z",
+            "gravity_x", "gravity_y", "gravity_z",
+            "command_x", "command_y", "command_yaw",
+            "scaled_command_x", "scaled_command_y", "scaled_command_yaw",
+            "action_wheel_l", "action_wheel_r",
+            "policy_dq_l", "policy_dq_r",
+            "pre_pitch_dq_l", "pre_pitch_dq_r", "pitch_correction",
+            "pre_hold_dq_l", "pre_hold_dq_r",
+            "wheel_hold_common", "wheel_hold_yaw",
+            "sent_dq_l", "sent_dq_r",
+            "actual_wheel_q_l", "actual_wheel_q_r",
+            "actual_wheel_dq_l", "actual_wheel_dq_r",
+            "actual_wheel_tau_l", "actual_wheel_tau_r",
+        ]
+        joint_fields = [f"joint_q_error_{i}" for i in range(self.joint_num)]
+        joint_fields += [f"joint_dq_{i}" for i in range(self.joint_num)]
+        encoder_fields = [f"encoder_{i}" for i in range(self.encoder_output_size)]
+        self.diagnostic_csv_fields = scalar_fields + joint_fields + encoder_fields
+
+        file_has_content = (
+            os.path.exists(self.diagnostic_csv_path)
+            and os.path.getsize(self.diagnostic_csv_path) > 0
+        )
+        if not file_has_content:
+            with open(
+                self.diagnostic_csv_path,
+                "a",
+                newline="",
+                encoding="utf-8",
+            ) as diagnostic_file:
+                csv.DictWriter(
+                    diagnostic_file,
+                    fieldnames=self.diagnostic_csv_fields,
+                ).writeheader()
 
     def initialize_onnx_models(self):
         # Configure ONNX Runtime session options to optimize CPU usage
@@ -238,6 +343,40 @@ class WheelfootController:
             pitch_comp_cfg.get('print_interval', 3.0)
         )
 
+        # Zero-command wheel odometry hold.  Unlike station_hold, this small
+        # residual is applied directly to the final wheel targets so real-world
+        # policy tracking error cannot hide the correction.  It is completely
+        # bypassed while the operator commands motion.
+        wheel_hold_cfg = stand_cfg.get('zero_command_wheel_hold', {})
+        self.wheel_hold_enabled = bool(wheel_hold_cfg.get('enabled', False))
+        self.wheel_hold_min_walk_time = float(
+            wheel_hold_cfg.get('min_walk_time', 3.0)
+        )
+        self.wheel_hold_position_kp = float(
+            wheel_hold_cfg.get('position_kp', 0.20)
+        )
+        self.wheel_hold_velocity_kd = float(
+            wheel_hold_cfg.get('velocity_kd', 0.05)
+        )
+        self.wheel_hold_yaw_position_kp = float(
+            wheel_hold_cfg.get('yaw_position_kp', 0.30)
+        )
+        self.wheel_hold_yaw_velocity_kd = float(
+            wheel_hold_cfg.get('yaw_velocity_kd', 0.08)
+        )
+        self.wheel_hold_common_limit = abs(float(
+            wheel_hold_cfg.get('common_correction_limit', 0.10)
+        ))
+        self.wheel_hold_yaw_limit = abs(float(
+            wheel_hold_cfg.get('yaw_correction_limit', 0.08)
+        ))
+        self.wheel_hold_accel_limit = abs(float(
+            wheel_hold_cfg.get('correction_accel_limit', 0.50)
+        ))
+        self.wheel_hold_zero_speed_limit = abs(float(
+            wheel_hold_cfg.get('zero_command_speed_limit', 6.0)
+        ))
+
         self.prepare_duration = float(fsm_cfg.get('prepare_duration', 1.0))
         self.shift_duration = float(fsm_cfg.get('shift_duration', 2.0))
         self.lift_duration = float(fsm_cfg.get('lift_duration', self.s2s_duration))
@@ -299,6 +438,11 @@ class WheelfootController:
         self.zero_pitch_comp_aborted = False
         self.zero_pitch_comp_stable_count = 0
         self.zero_pitch_comp_filtered_rate = 0.0
+        self.wheel_hold_prev_q = None
+        self.wheel_hold_integrated_q = np.zeros(2, dtype=float)
+        self.wheel_hold_anchor_q = np.zeros(2, dtype=float)
+        self.wheel_hold_common_output = 0.0
+        self.wheel_hold_yaw_output = 0.0
 
         self.joint_pos_idxs = config['PointfootCfg']['size']['jointpos_idxs']
         self.wheel_joint_damping = config['PointfootCfg']['control']['wheel_joint_damping']
@@ -318,7 +462,6 @@ class WheelfootController:
             time.sleep(0.1)
 
         # >>> S2S: never capture the zero-initialized placeholder RobotState.
-        print("Waiting for the first RobotState and IMU packets...")
         deadline = time.monotonic() + 5.0
         while self.start_controller and not (self.has_robot_state and self.has_imu_data):
             if time.monotonic() >= deadline:
@@ -364,17 +507,12 @@ class WheelfootController:
         self.mode = "KNEEL_HOLD"
         self.loop_count = 0
 
-        print(
-            "Squat-to-stand initialized: "
-            f"pitch={np.degrees(self.stand_start_pitch):.1f} deg -> "
-            f"handoff={np.degrees(self.stand_handoff_pitch):.1f} deg"
-        )
-
         rate = Rate(self.loop_frequency)
         while self.start_controller:
             self.update()
             rate.sleep()
 
+        self.flush_walk_diagnostic(force=True)
         self.robot_cmd.q = [0. for _ in range(self.joint_num)]
         self.robot_cmd.dq = [0. for _ in range(self.joint_num)]
         self.robot_cmd.tau = [0. for _ in range(self.joint_num)]
@@ -480,7 +618,6 @@ class WheelfootController:
             )[:self.joint_num].copy()
             self.wheel_start_angles = self.phase_start_angles.copy()
             self.fsm_last_leg_target = self.phase_start_angles.copy()
-            print("KNEEL_HOLD -> PREPARE_SUPPORT")
 
     @staticmethod
     def quintic_blend(value):
@@ -554,6 +691,121 @@ class WheelfootController:
         if clear_abort:
             self.zero_pitch_comp_aborted = False
 
+    def reset_zero_command_wheel_hold(self):
+        """Reset continuous wheel odometry and its direct hold residual."""
+        self.wheel_hold_prev_q = None
+        self.wheel_hold_integrated_q.fill(0.0)
+        self.wheel_hold_anchor_q.fill(0.0)
+        self.wheel_hold_common_output = 0.0
+        self.wheel_hold_yaw_output = 0.0
+
+    def apply_zero_command_wheel_hold(self):
+        """Hold translation and differential wheel travel at zero command.
+
+        Wheel positions are integrated from wrapped per-frame increments so
+        this works with both continuous MuJoCo angles and wrapping hardware
+        encoders.  Common-mode feedback suppresses translation; differential
+        feedback suppresses unintended yaw.  Only the residual is bounded,
+        and all limiting is bypassed for a real operator command.
+        """
+        if not self.wheel_hold_enabled:
+            return
+
+        wheel_indices = self.get_wheel_indices()
+        if len(wheel_indices) != 2:
+            return
+
+        q = np.asarray(
+            [self.robot_state_tmp.q[i] for i in wheel_indices], dtype=float
+        )
+        dq = np.asarray(
+            [self.robot_state_tmp.dq[i] for i in wheel_indices], dtype=float
+        )
+        if not np.all(np.isfinite(q)) or not np.all(np.isfinite(dq)):
+            self.wheel_hold_common_output = 0.0
+            self.wheel_hold_yaw_output = 0.0
+            return
+
+        if self.wheel_hold_prev_q is None:
+            self.wheel_hold_prev_q = q.copy()
+            self.wheel_hold_anchor_q = self.wheel_hold_integrated_q.copy()
+            return
+
+        raw_delta = q - self.wheel_hold_prev_q
+        wrapped_delta = np.arctan2(np.sin(raw_delta), np.cos(raw_delta))
+        self.wheel_hold_prev_q = q.copy()
+
+        signs = np.asarray(
+            [self.balance_left_wheel_sign, self.balance_right_wheel_sign],
+            dtype=float,
+        )
+        signed_delta = signs * wrapped_delta
+        signed_dq = signs * dq
+        self.wheel_hold_integrated_q += signed_delta
+
+        elapsed = self.loop_count / self.loop_frequency
+        handoff_active = getattr(self, 'rl_handoff_blend_active', False)
+        hold_ready = (
+            self.user_zero_command
+            and elapsed >= self.wheel_hold_min_walk_time
+            and not handoff_active
+            and self.zero_pitch_comp_active
+            and not self.zero_pitch_comp_aborted
+        )
+        if not hold_ready:
+            # Moving, standing up, or blending: follow the wheels so the next
+            # neutral interval starts from the current position without a jump.
+            self.wheel_hold_anchor_q = self.wheel_hold_integrated_q.copy()
+            self.wheel_hold_common_output = 0.0
+            self.wheel_hold_yaw_output = 0.0
+            return
+
+        position_error = self.wheel_hold_integrated_q - self.wheel_hold_anchor_q
+        common_position = float(0.5 * np.sum(position_error))
+        yaw_position = float(0.5 * (position_error[0] - position_error[1]))
+        common_velocity = float(0.5 * np.sum(signed_dq))
+        yaw_velocity = float(0.5 * (signed_dq[0] - signed_dq[1]))
+
+        common_target = float(np.clip(
+            -self.wheel_hold_position_kp * common_position
+            -self.wheel_hold_velocity_kd * common_velocity,
+            -self.wheel_hold_common_limit,
+            self.wheel_hold_common_limit,
+        ))
+        yaw_target = float(np.clip(
+            -self.wheel_hold_yaw_position_kp * yaw_position
+            -self.wheel_hold_yaw_velocity_kd * yaw_velocity,
+            -self.wheel_hold_yaw_limit,
+            self.wheel_hold_yaw_limit,
+        ))
+
+        max_step = self.wheel_hold_accel_limit / self.loop_frequency
+        self.wheel_hold_common_output += float(np.clip(
+            common_target - self.wheel_hold_common_output,
+            -max_step,
+            max_step,
+        ))
+        self.wheel_hold_yaw_output += float(np.clip(
+            yaw_target - self.wheel_hold_yaw_output,
+            -max_step,
+            max_step,
+        ))
+
+        signed_corrections = np.asarray([
+            self.wheel_hold_common_output + self.wheel_hold_yaw_output,
+            self.wheel_hold_common_output - self.wheel_hold_yaw_output,
+        ])
+        raw_corrections = signs * signed_corrections
+        action_scale = self.control_cfg['action_scale_vel']
+        for index, correction in zip(wheel_indices, raw_corrections):
+            final_dq = float(np.clip(
+                self.robot_cmd.dq[index] + correction,
+                -self.wheel_hold_zero_speed_limit,
+                self.wheel_hold_zero_speed_limit,
+            ))
+            self.robot_cmd.dq[index] = final_dq
+            self.last_actions[index] = final_dq / action_scale
+
     def apply_zero_command_pitch_compensation(self):
         """Add a bounded pitch-PD residual to wheel targets after RL handoff.
 
@@ -561,6 +813,7 @@ class WheelfootController:
         near the standing pitch with a low pitch rate.  A large pitch or rate
         disables it until the operator moves the joystick or WALK is restarted.
         """
+        self.zero_pitch_comp_last_correction = 0.0
         if not self.zero_pitch_comp_enabled:
             return
 
@@ -592,7 +845,7 @@ class WheelfootController:
         ):
             self.zero_pitch_comp_active = False
             self.zero_pitch_comp_aborted = True
-            print(
+            self.logger.warning(
                 "ZERO_CMD_PITCH_COMP safety release | "
                 f"pitch={np.degrees(pitch):+.2f}deg | "
                 f"pitch_rate={filtered_rate:+.3f}rad/s"
@@ -617,7 +870,7 @@ class WheelfootController:
             )
             if self.zero_pitch_comp_stable_count >= required_count:
                 self.zero_pitch_comp_active = True
-                print(
+                self.logger.info(
                     "ZERO_CMD_PITCH_COMP armed | "
                     f"pitch={np.degrees(pitch):+.2f}deg | "
                     f"pitch_rate={filtered_rate:+.3f}rad/s"
@@ -627,6 +880,7 @@ class WheelfootController:
             [self.robot_cmd.dq[i] for i in wheel_indices],
             dtype=float,
         )
+        self.pre_pitch_wheel_dq = policy_wheel_dq.copy()
         correction = 0.0
 
         if self.zero_pitch_comp_active:
@@ -660,34 +914,7 @@ class WheelfootController:
                     final_dq / self.control_cfg['action_scale_vel']
                 )
 
-        print_period = max(
-            1,
-            int(self.zero_pitch_comp_print_interval * self.loop_frequency),
-        )
-        if self.loop_count % print_period == 0:
-            actual_wheel_dq = np.asarray(
-                [self.robot_state_tmp.dq[i] for i in wheel_indices],
-                dtype=float,
-            )
-            sent_wheel_dq = np.asarray(
-                [self.robot_cmd.dq[i] for i in wheel_indices],
-                dtype=float,
-            )
-            state = (
-                "ACTIVE" if self.zero_pitch_comp_active
-                else "ABORT" if self.zero_pitch_comp_aborted
-                else "WAIT"
-            )
-            print(
-                f"ZERO_CMD_PITCH_COMP {state} | "
-                f"pitch={np.degrees(pitch):+.2f}deg | "
-                f"pitch_rate={pitch_rate:+.3f}rad/s | "
-                f"filtered_rate={filtered_rate:+.3f}rad/s | "
-                f"policy_dq={policy_wheel_dq.round(3).tolist()} | "
-                f"correction={correction:+.3f}rad/s | "
-                f"sent_dq={sent_wheel_dq.round(3).tolist()} | "
-                f"actual_dq={actual_wheel_dq.round(3).tolist()}"
-            )
+        self.zero_pitch_comp_last_correction = correction
 
     def transition_standup_phase(self, new_mode, reason=""):
         """Every phase starts from the current measured pose, not an old reference."""
@@ -703,9 +930,9 @@ class WheelfootController:
                 self.get_full_orientation_state())
         if new_mode == "ABORT_HOLD":
             self.abort_hold_angles = self.phase_start_angles.copy()
-            print(f"Stand-up ABORT: {reason or 'safety condition'}")
+            self.logger.error(f"Stand-up ABORT: {reason or 'safety condition'}")
         else:
-            print(f"Stand-up phase: {old_mode} -> {new_mode}")
+            self.logger.info(f"Stand-up phase: {old_mode} -> {new_mode}")
 
     def begin_rl_direct(self):
         """Start the existing RL controller and initialize position holding."""
@@ -736,8 +963,11 @@ class WheelfootController:
         self.phase_timer = 0.0
         self.balance_wheel_velocity = 0.0
         self.reset_zero_command_pitch_compensation(clear_abort=True)
+        self.reset_zero_command_wheel_hold()
+        self._walk_log_buffer = []
+        self._last_walk_log_flush_time = None
         self.mode = "WALK"
-        print("KNEE_RELEASE -> WALK: direct zero-command RL handoff")
+        self.logger.info("KNEE_RELEASE -> WALK: direct zero-command RL handoff")
 
     def apply_rl_handoff_blend(self):
         """Make the short FSM-to-policy target transition continuous."""
@@ -797,7 +1027,7 @@ class WheelfootController:
         )
 
         if ready:
-            print(
+            self.logger.info(
                 "RL_EARLY_HANDOFF | "
                 f"pitch={np.degrees(pitch):+.1f}deg | "
                 f"pitch_rate={pitch_rate:+.3f}rad/s | "
@@ -927,17 +1157,6 @@ class WheelfootController:
         self.commands[0] = self.rl_hold_command_x
         self.rl_hold_last_output = self.rl_hold_command_x
 
-        period = max(
-            1,
-            int(self.loop_frequency * 3.0),
-        )
-        if self.loop_count % period == 0:
-            print(
-                "STATION_HOLD | "
-                f"dx={position_error:+.3f}m | "
-                f"v={velocity:+.3f}m/s | "
-                f"cmd_x={self.rl_hold_command_x:+.3f}m/s"
-            )
     ##################################################################################
     
     def fsm_wheel_commands(self, target_pitch_rad):
@@ -1199,7 +1418,7 @@ class WheelfootController:
                     np.abs(rl_q[legs] - fsm_q[legs])
                 ))
 
-                print(
+                self.logger.info(
                     "RL_HANDOFF | "
                     f"progress={progress:.3f} | "
                     f"pitch={np.degrees(pitch):+.1f}deg | "
@@ -1222,20 +1441,6 @@ class WheelfootController:
                     "RL handoff knee angle not reached"
                 )
 
-        period = max(1, int(self.loop_frequency * 0.5))
-        q_now = np.asarray(self.robot_state_tmp.q, dtype=float)
-        knee_l = self.joint_names.index('knee_L_Joint')
-        knee_r = self.joint_names.index('knee_R_Joint')
-
-        if self.loop_count % period == 0:
-            print(
-                f"FSM={self.mode}, t={self.phase_timer:.2f}s, "
-                f"roll={np.degrees(roll):+.1f}deg, "
-                f"pitch={np.degrees(pitch):+.1f}deg, "
-                f"wheel_dx={self.get_wheel_displacement():+.3f}rad,"
-                f"knees=[{q_now[knee_l]:+.3f},{q_now[knee_r]:+.3f}]"
-            )
-
         if self.mode not in {"ABORT_HOLD", "STAND_HOLD"}:
             self.phase_timer += dt
 
@@ -1257,7 +1462,6 @@ class WheelfootController:
 
         self.loop_count = -1
         self.mode = "RL_BLEND"
-        print("STAND_UP -> RL_BLEND (zero command)")
 
     def handle_rl_blend(self):
         """Blend posture into the original RL controller, then leave WALK untouched."""
@@ -1301,20 +1505,10 @@ class WheelfootController:
                     self.control_cfg['damping']
                 )
 
-        period = max(1, int(self.loop_frequency * 0.25))
-        if self.loop_count % period == 0:
-            pitch, pitch_rate = self.get_pitch_state()
-            print(
-                f"RL_BLEND {100.0 * alpha:5.1f}% | "
-                f"pitch={np.degrees(pitch):6.1f} deg | "
-                f"rate={pitch_rate:5.2f}"
-            )
-
         self.phase_timer += dt
         if t >= 1.0:
             self.mode = "WALK"
             self.phase_timer = 0.0
-            print("RL_BLEND -> WALK: original RL controller fully active")
 
     # Handle the walk mode where the robot moves based on computed actions
     def handle_walk_mode(self):
@@ -1325,10 +1519,15 @@ class WheelfootController:
         # RL actions and actuator commands remain unchanged.
         self.update_station_hold_command()
 
-        if self.loop_count % self.control_cfg["decimation"] == 0:
+        policy_updated = self.loop_count % self.control_cfg["decimation"] == 0
+        if policy_updated:
+            policy_start = time.perf_counter()
             self.compute_observation()
             self.compute_encoder()
             self.compute_actions()
+            self.last_policy_compute_ms = (
+                time.perf_counter() - policy_start
+            ) * 1000.0
 
             action_min = -self.rl_cfg[
                 "clip_scales"
@@ -1435,9 +1634,172 @@ class WheelfootController:
                     self.wheel_joint_damping,
                 )
 
+        wheel_indices = self.get_wheel_indices()
+        self.last_policy_wheel_dq = np.asarray(
+            [self.robot_cmd.dq[i] for i in wheel_indices],
+            dtype=float,
+        )
         self.apply_rl_handoff_blend()
+        self.pre_pitch_wheel_dq = np.asarray(
+            [self.robot_cmd.dq[i] for i in wheel_indices],
+            dtype=float,
+        )
         # Final deployment-side residual: RL -> handoff blend -> pitch PD -> send.
         self.apply_zero_command_pitch_compensation()
+        self.pre_wheel_hold_dq = np.asarray(
+            [self.robot_cmd.dq[i] for i in wheel_indices],
+            dtype=float,
+        )
+        # Final zero-command wheel residual: translation/yaw hold and neutral
+        # speed cap.  A nonzero operator command bypasses this path entirely.
+        self.apply_zero_command_wheel_hold()
+        if policy_updated:
+            self.log_walk_diagnostic()
+
+    def log_walk_diagnostic(self):
+        """Buffer one policy-frame snapshot and flush the CSV batch every second."""
+        wheel_indices = self.get_wheel_indices()
+        if len(wheel_indices) != 2:
+            return
+
+        quat = np.asarray(self.imu_data_tmp.quat, dtype=float)
+        gyro = np.asarray(self.imu_data_tmp.gyro, dtype=float)[:3]
+        gravity = np.full(3, np.nan, dtype=float)
+        if quat.size == 4 and np.all(np.isfinite(quat)):
+            quat_norm = np.linalg.norm(quat)
+            if quat_norm > 1.0e-6:
+                gravity = R.from_quat(quat / quat_norm).inv().apply(
+                    np.array([0.0, 0.0, -1.0])
+                )
+                offset_rot = R.from_euler(
+                    'zyx', self.imu_orientation_offset
+                ).as_matrix()
+                gravity = offset_rot @ gravity
+                gyro = offset_rot @ gyro
+
+        pitch = float(np.arctan2(gravity[0], -gravity[2]))
+        roll = float(np.arctan2(-gravity[1], -gravity[2]))
+        actual_wheel_q = np.asarray(
+            [self.robot_state_tmp.q[i] for i in wheel_indices],
+            dtype=float,
+        )
+        actual_wheel_dq = np.asarray(
+            [self.robot_state_tmp.dq[i] for i in wheel_indices],
+            dtype=float,
+        )
+        actual_wheel_tau = np.asarray(
+            [self.robot_state_tmp.tau[i] for i in wheel_indices],
+            dtype=float,
+        )
+        sent_wheel_dq = np.asarray(
+            [self.robot_cmd.dq[i] for i in wheel_indices],
+            dtype=float,
+        )
+        joint_q = np.asarray(self.robot_state_tmp.q, dtype=float)[:self.joint_num]
+        joint_dq = np.asarray(self.robot_state_tmp.dq, dtype=float)[:self.joint_num]
+        joint_q_error = joint_q - self.init_joint_angles
+        comp_state = (
+            "ACTIVE" if self.zero_pitch_comp_active
+            else "ABORT" if self.zero_pitch_comp_aborted
+            else "WAIT"
+        )
+
+        now = time.monotonic()
+        state_age_ms = (
+            (now - self.last_robot_state_received_time) * 1000.0
+            if self.last_robot_state_received_time > 0.0 else None
+        )
+        imu_age_ms = (
+            (now - self.last_imu_received_time) * 1000.0
+            if self.last_imu_received_time > 0.0 else None
+        )
+        command = np.asarray(self.commands, dtype=float)
+        scaled_command = np.asarray(self.scaled_commands, dtype=float)
+        actions_wheel = np.asarray(self.actions, dtype=float)[wheel_indices]
+        sample = {
+            "session": self.diagnostic_session,
+            "time_monotonic_s": round(now, 6),
+            "loop": int(self.loop_count),
+            "loop_dt_ms": round(self.last_loop_dt_ms, 4),
+            "policy_compute_ms": round(self.last_policy_compute_ms, 4),
+            "robot_stamp": int(getattr(self.robot_state_tmp, "stamp", 0)),
+            "imu_stamp": int(getattr(self.imu_data_tmp, "stamp", 0)),
+            "state_age_ms": None if state_age_ms is None else round(state_age_ms, 3),
+            "imu_age_ms": None if imu_age_ms is None else round(imu_age_ms, 3),
+            "comp": comp_state,
+            "pitch_deg": round(float(np.degrees(pitch)), 5),
+            "roll_deg": round(float(np.degrees(roll)), 5),
+            "gyro_x": round(float(gyro[0]), 6),
+            "gyro_y": round(float(gyro[1]), 6),
+            "gyro_z": round(float(gyro[2]), 6),
+            "gravity_x": round(float(gravity[0]), 7),
+            "gravity_y": round(float(gravity[1]), 7),
+            "gravity_z": round(float(gravity[2]), 7),
+            "command_x": round(float(command[0]), 5),
+            "command_y": round(float(command[1]), 5),
+            "command_yaw": round(float(command[2]), 5),
+            "scaled_command_x": round(float(scaled_command[0]), 5),
+            "scaled_command_y": round(float(scaled_command[1]), 5),
+            "scaled_command_yaw": round(float(scaled_command[2]), 5),
+            "action_wheel_l": round(float(actions_wheel[0]), 5),
+            "action_wheel_r": round(float(actions_wheel[1]), 5),
+            "policy_dq_l": round(float(self.last_policy_wheel_dq[0]), 5),
+            "policy_dq_r": round(float(self.last_policy_wheel_dq[1]), 5),
+            "pre_pitch_dq_l": round(float(self.pre_pitch_wheel_dq[0]), 5),
+            "pre_pitch_dq_r": round(float(self.pre_pitch_wheel_dq[1]), 5),
+            "pitch_correction": round(float(self.zero_pitch_comp_last_correction), 5),
+            "pre_hold_dq_l": round(float(self.pre_wheel_hold_dq[0]), 5),
+            "pre_hold_dq_r": round(float(self.pre_wheel_hold_dq[1]), 5),
+            "wheel_hold_common": round(float(self.wheel_hold_common_output), 5),
+            "wheel_hold_yaw": round(float(self.wheel_hold_yaw_output), 5),
+            "sent_dq_l": round(float(sent_wheel_dq[0]), 5),
+            "sent_dq_r": round(float(sent_wheel_dq[1]), 5),
+            "actual_wheel_q_l": round(float(actual_wheel_q[0]), 5),
+            "actual_wheel_q_r": round(float(actual_wheel_q[1]), 5),
+            "actual_wheel_dq_l": round(float(actual_wheel_dq[0]), 5),
+            "actual_wheel_dq_r": round(float(actual_wheel_dq[1]), 5),
+            "actual_wheel_tau_l": round(float(actual_wheel_tau[0]), 5),
+            "actual_wheel_tau_r": round(float(actual_wheel_tau[1]), 5),
+        }
+        for index, value in enumerate(joint_q_error):
+            sample[f"joint_q_error_{index}"] = round(float(value), 5)
+        for index, value in enumerate(joint_dq):
+            sample[f"joint_dq_{index}"] = round(float(value), 5)
+        for index, value in enumerate(np.asarray(self.encoder_out, dtype=float)):
+            sample[f"encoder_{index}"] = round(float(value), 5)
+        self._walk_log_buffer.append(sample)
+        self.flush_walk_diagnostic(now=now)
+
+    def flush_walk_diagnostic(self, force=False, now=None):
+        """Write all buffered 50 Hz samples with one file operation."""
+        if not self._walk_log_buffer:
+            return
+        if now is None:
+            now = time.monotonic()
+        if self._last_walk_log_flush_time is None:
+            self._last_walk_log_flush_time = now
+            if not force:
+                return
+        if (
+            not force
+            and now - self._last_walk_log_flush_time < self.controller_log_interval
+        ):
+            return
+
+        with open(
+            self.diagnostic_csv_path,
+            "a",
+            newline="",
+            encoding="utf-8",
+        ) as diagnostic_file:
+            writer = csv.DictWriter(
+                diagnostic_file,
+                fieldnames=self.diagnostic_csv_fields,
+            )
+            writer.writerows(self._walk_log_buffer)
+            diagnostic_file.flush()
+        self._walk_log_buffer = []
+        self._last_walk_log_flush_time = now
 
     def swap_positions(self, initial_array, reverse=False, exclude_wheel=False):
         if not exclude_wheel:
@@ -1606,6 +1968,12 @@ class WheelfootController:
     def update(self):
         "整个程序，机器人运动的入口，每走一步都会从这里面更新"
         """Run S2S only at startup; once WALK is reached, use the original RL path."""
+        update_time = time.monotonic()
+        if self._last_update_time is not None:
+            self.last_loop_dt_ms = (
+                update_time - self._last_update_time
+            ) * 1000.0
+        self._last_update_time = update_time
         self.robot_state_tmp = copy.deepcopy(self.robot_state)
         self.imu_data_tmp = copy.deepcopy(self.imu_data)
 
@@ -1633,6 +2001,7 @@ class WheelfootController:
         robot_state (datatypes.RobotState): The current state of the robot.
         """
         self.robot_state = robot_state
+        self.last_robot_state_received_time = time.monotonic()
         self.has_robot_state = True
 
     # Callback function for receiving imu data
@@ -1652,20 +2021,19 @@ class WheelfootController:
         self.imu_data.quat[1] = imu_data.quat[2]
         self.imu_data.quat[2] = imu_data.quat[3]
         self.imu_data.quat[3] = imu_data.quat[0]
+        self.last_imu_received_time = time.monotonic()
         self.has_imu_data = True
 
     # Callback function for receiving sensor joy data
     def sensor_joy_callback(self, sensor_joy: datatypes.SensorJoy):
         # Check if the robot is in the calibration state and both L1 (button index 4) and Y (button index 3) buttons are pressed.
         if not self.start_controller and self.calibration_state == 0 and sensor_joy.buttons[4] == 1 and sensor_joy.buttons[3] == 1:
-          print(f"L1 + Y: start_controller...")
-          print("=====机器人开始运动======")
+          self.logger.info("L1 + Y: start_controller; robot motion enabled")
           self.start_controller = True
 
         # Check if both L1 (button index 4) and X (button index 2) are pressed to stop the controller
         if self.start_controller and sensor_joy.buttons[4] == 1 and sensor_joy.buttons[2] == 1:
-          print(f"L1 + X: stop_controller...")
-          print("=====机器人停止运动，进入空闲状态======")
+          self.logger.info("L1 + X: stop_controller; entering idle state")
           self.commands.fill(0.0)
           self.start_controller = False
           return
@@ -1695,6 +2063,4 @@ class WheelfootController:
     def robot_diagnostic_callback(self, diagnostic_value: datatypes.DiagnosticValue):
       # Check if the received diagnostic data is related to calibration.
       if diagnostic_value.name == "calibration":
-        print("=====0820-am debugging ======")
-        print(f"Calibration state: {diagnostic_value.code}")
         self.calibration_state = diagnostic_value.code
