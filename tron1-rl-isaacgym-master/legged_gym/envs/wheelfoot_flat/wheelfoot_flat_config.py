@@ -551,7 +551,7 @@ class BipedCfgPPOWF(BaseConfig):
         policy_class_name = "ActorCritic"
         algorithm_class_name = "PPO"
         num_steps_per_env = 24  # per iteration
-        max_iterations = 20000
+        max_iterations = 1500
 
         # logging
         logger = "tensorboard"
@@ -559,12 +559,12 @@ class BipedCfgPPOWF(BaseConfig):
         wandb_project = "legged_gym_WF"
         save_interval = 500  # check for potential saves every this many iterations
         experiment_name = "WF_TRON1A"
-        run_name = "S2_stair_from_model3000"
+        run_name = "S3_zero_command_drift_fix"
 
         resume = True
-        load_run = "Aug11_11-40-32_S1_plane_3000_"
-        checkpoint = 3000
-        resume_path = "/home/pc/tron1-rl-isaacgym-master/logs/wheelfoot_flat/WF_TRON1A/Aug11_11-40-32_S1_plane_3000_/model_3000.pt"
+        load_run = "Aug12_11-25-54_S2_stair_from_model3000"
+        checkpoint = 22000
+        resume_path = "/home/pc/tron1-rl-isaacgym-master/logs/wheelfoot_flat/WF_TRON1A/Aug12_11-25-54_S2_stair_from_model3000/model_22000.pt"
         # load_run = (
         #     "Aug09_17-54-33_"
         #     "S21_continuous_clearance_from_model54000"

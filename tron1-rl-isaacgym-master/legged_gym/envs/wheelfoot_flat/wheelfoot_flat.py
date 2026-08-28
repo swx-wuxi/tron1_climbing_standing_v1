@@ -35,7 +35,7 @@ class BipedWF(BaseTask):
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
         self.pi = torch.acos(torch.zeros(1, device=self.device)) * 2
         self.group_idx = torch.arange(0, self.cfg.env.num_envs)
-
+        print("=====跑的确实是swx的程序======")
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
         self._init_buffers()
@@ -2444,10 +2444,23 @@ class BipedWF(BaseTask):
         # Penalize xy axes base angular velocity
         return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
 
+    def _reward_stable_walk_pitch(self):
+        # The deployment stand-up FSM hands control to RL only in WALK. Delay
+        # this term after each reset so it shapes settled walking, not handoff.
+        stable_walk_mask = (
+            self.envs_steps_buf * self.sim_params.dt
+            >= self.cfg.rewards.stable_walk_pitch_start_time
+        )
+        pitch = torch.atan2(
+            self.projected_gravity[:, 0], -self.projected_gravity[:, 2]
+        )
+        pitch_error = pitch - self.cfg.rewards.stable_walk_pitch_target
+        return torch.square(pitch_error) * stable_walk_mask
+
     def _reward_orientation(self):
-        # Penalize non flat base orientation
-        reward = torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
-        return reward
+        # Keep strong roll stabilization here. Pitch is shaped separately by
+        # _reward_stable_walk_pitch only after the WALK settling mask opens.
+        return torch.square(self.projected_gravity[:, 1])
 
     def _reward_torques(self):
         # Penalize torques
