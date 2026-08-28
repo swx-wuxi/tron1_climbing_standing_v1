@@ -336,6 +336,7 @@ class BipedCfgWF(BaseConfig):
             same_foot_z_position = 0.0
             lin_vel_z = -0.3
             ang_vel_xy = -0.3
+            stable_walk_pitch_rate = -0.5
             torques = -0.00016
             dof_acc = -1.5e-7
             action_rate = -0.03
@@ -387,6 +388,7 @@ class BipedCfgWF(BaseConfig):
         soft_dof_vel_limit = 1.0
         soft_torque_limit = 0.8
         base_height_target = 0.62 + 0.1664
+        stable_walk_pitch_rate_start_time = 3.0  # [s]
         stair_horizontal_force_threshold = 20.0  # [N], elevated-impact detector
         # Estimated horizontal-force application point must be this far above
         # the wheel bottom, filtering horizontal tread-friction forces.
@@ -559,23 +561,17 @@ class BipedCfgPPOWF(BaseConfig):
         wandb_project = "legged_gym_WF"
         save_interval = 500  # check for potential saves every this many iterations
         experiment_name = "WF_TRON1A"
-        run_name = "S3_zero_command_drift_fix"
+        run_name = "S4_zero_command_drift_continue"
 
         resume = True
-        load_run = "Aug12_11-25-54_S2_stair_from_model3000"
-        checkpoint = 22000
-        resume_path = "/home/pc/tron1-rl-isaacgym-master/logs/wheelfoot_flat/WF_TRON1A/Aug12_11-25-54_S2_stair_from_model3000/model_22000.pt"
-        # load_run = (
-        #     "Aug09_17-54-33_"
-        #     "S21_continuous_clearance_from_model54000"
-        # )
-        # checkpoint = 66500
-        # resume_path = (
-        #     "/home/pc/wuzeyu128/tongshuo/pointfoot-legged-gym/logs/"
-        #     "pointfoot_flat/WF_TRON1A/"
-        #     "Aug09_17-54-33_S21_continuous_clearance_from_model54000/"
-        #     "model_66500.pt"
-        # )
+        # load_run = "Aug12_11-25-54_S2_stair_from_model3000"
+        # checkpoint = 20000
+        # resume_path = "/home/pc/tron1-rl-isaacgym-master/logs/wheelfoot_flat/WF_TRON1A/Aug12_11-25-54_S2_stair_from_model3000/model_22000.pt"
+        
+        load_run = "Aug28_11-01-36_S3_zero_command_drift_fix"
+        checkpoint = 21500
+        resume_path = "/home/pc/tron1-rl-isaacgym-master/logs/wheelfoot_flat/WF_TRON1A/Aug28_11-01-36_S3_zero_command_drift_fix/model_21500.pt"
+
         resume_iteration = 3000   # 66500
         # Keep the checkpoint network/optimizer loading path unchanged.
         zero_critic_height_input_on_resume = False
