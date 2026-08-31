@@ -4,6 +4,8 @@ import copy
 import csv
 import logging
 import numpy as np
+import socket
+import struct
 import yaml
 import time
 import onnxruntime as ort
@@ -121,6 +123,18 @@ class WheelfootController:
         self.pre_pitch_wheel_dq = np.zeros(2, dtype=float)
         self.pre_wheel_hold_dq = np.zeros(2, dtype=float)
         self.zero_pitch_comp_last_correction = 0.0
+        # Read-only zero-gap telemetry is sent only while the standalone
+        # monitor owns this Unix datagram endpoint.  With no monitor running,
+        # there is no file/log and probes are limited to once per second.
+        zero_gap_mode = "sim" if start_controller else "real"
+        self._zero_gap_address = f"/tmp/tron1_zero_gap_{zero_gap_mode}.sock"
+        self._zero_gap_socket = None
+        self._zero_gap_next_probe = 0.0
+        self._zero_gap_packet = struct.Struct("<4sQ6d")
+        self._zero_gap_pitch_rate = float("nan")
+        self._zero_gap_projected_gravity_x = float("nan")
+        self._zero_gap_raw_wheel_action = np.full(2, np.nan, dtype=float)
+        self._zero_gap_policy_sample_valid = False
         self.setup_diagnostic_csv()
 
     def setup_file_logger(self):
@@ -1525,6 +1539,16 @@ class WheelfootController:
             self.compute_observation()
             self.compute_encoder()
             self.compute_actions()
+            raw_policy_actions = np.asarray(self.actions, dtype=float).copy()
+            if self.rl_type == "isaaclab":
+                raw_policy_actions = self.swap_positions(
+                    raw_policy_actions,
+                    reverse=True,
+                )
+            self._zero_gap_raw_wheel_action = raw_policy_actions[
+                self.get_wheel_indices()
+            ].copy()
+            self._zero_gap_policy_sample_valid = True
             self.last_policy_compute_ms = (
                 time.perf_counter() - policy_start
             ) * 1000.0
@@ -1655,6 +1679,44 @@ class WheelfootController:
         self.apply_zero_command_wheel_hold()
         if policy_updated:
             self.log_walk_diagnostic()
+
+    def publish_zero_gap_snapshot(self):
+        """Non-blocking, read-only telemetry for zero_gap_monitor.py."""
+        if not self._zero_gap_policy_sample_valid:
+            return
+        if self.loop_count % self.control_cfg["decimation"] != 0:
+            return
+
+        now = time.monotonic()
+        if self._zero_gap_socket is None:
+            if now < self._zero_gap_next_probe:
+                return
+            self._zero_gap_socket = socket.socket(
+                socket.AF_UNIX,
+                socket.SOCK_DGRAM,
+            )
+            self._zero_gap_socket.setblocking(False)
+
+        wheel_indices = self.get_wheel_indices()
+        if len(wheel_indices) != 2:
+            return
+        sent_wheel_dq = [self.robot_cmd.dq[i] for i in wheel_indices]
+        packet = self._zero_gap_packet.pack(
+            b"ZGM1",
+            time.time_ns(),
+            self._zero_gap_pitch_rate,
+            self._zero_gap_projected_gravity_x,
+            self._zero_gap_raw_wheel_action[0],
+            self._zero_gap_raw_wheel_action[1],
+            sent_wheel_dq[0],
+            sent_wheel_dq[1],
+        )
+        try:
+            self._zero_gap_socket.sendto(packet, self._zero_gap_address)
+        except OSError:
+            self._zero_gap_socket.close()
+            self._zero_gap_socket = None
+            self._zero_gap_next_probe = now + 1.0
 
     def log_walk_diagnostic(self):
         """Buffer one policy-frame snapshot and flush the CSV batch every second."""
@@ -1904,6 +1966,10 @@ class WheelfootController:
             -self.rl_cfg['clip_scales']['clip_observations'],  # Lower limit for clipping
             self.rl_cfg['clip_scales']['clip_observations']  # Upper limit for clipping
         )
+        # Copy the exact, scaled/clipped values that are passed to the policy.
+        # Observation layout: angular velocity [0:3], projected gravity [3:6].
+        self._zero_gap_pitch_rate = float(self.observations[1])
+        self._zero_gap_projected_gravity_x = float(self.observations[3])
 
     def compute_actions(self):
         """
@@ -1989,6 +2055,7 @@ class WheelfootController:
         elif self.mode == "WALK":
             self.handle_walk_mode()
 
+        self.publish_zero_gap_snapshot()
         self.loop_count += 1
         self.robot.publishRobotCmd(self.robot_cmd)
         
