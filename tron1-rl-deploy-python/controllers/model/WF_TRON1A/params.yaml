@@ -31,6 +31,44 @@ PointfootCfg:
     decimation: 10
     user_torque_limit: 80
 
+  # Opt-in actuator-response experiment.  Every excitation is disabled and
+  # all physical amplitudes/frequencies are inert placeholders until they are
+  # validated first in simulation and then for the specific supported robot.
+  # The 5--10 cm / 1--25 Hz ANYmal ranges are intentionally not copied here.
+  actuator_data_collection:
+    enabled: false
+    duration_s: 0.0
+    ramp_duration_s: 1.0
+    tau_ff_nm: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    leg_excitation:
+      enabled: false
+      # Base-frame wheel-center displacement [x, y, z].
+      foot_amplitude_m: [0.0, 0.0, 0.0]
+      frequency_hz: 0.0
+      phase_rad: [0.0, 0.0]
+
+    wheel_excitation:
+      enabled: false
+      velocity_amplitude_rad_s: [0.0, 0.0]
+      frequency_hz: 0.0
+      phase_rad: [0.0, 0.0]
+
+    ik:
+      damping: 0.001
+      tolerance_m: 0.00001
+      max_iterations: 8
+      max_step_rad: 0.10
+
+    safety:
+      # These remain zero so enabling collection without reviewed limits fails
+      # before the controller publishes any experiment command.
+      max_command_speed_rad_s: 0.0
+      max_tracking_error_rad: 0.0
+      max_tilt_deg: 0.0
+      joint_limit_margin_rad: 0.10
+      tracking_grace_s: 0.25
+
   normalization:
     clip_scales:
       clip_observations: 100.0

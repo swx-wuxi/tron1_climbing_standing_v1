@@ -1,86 +1,98 @@
 #!/usr/bin/env python3
-"""Passive MuJoCo/real TRON1 zero-gap monitor.
+"""Passive high-rate MuJoCo/real TRON1 actuator-data CSV monitor.
 
-The process subscribes to RobotState for measured wheel velocity and receives
-read-only policy/controller snapshots over a local Unix datagram socket.  It
-never constructs or publishes RobotCmd.
+The controller sends synchronized final-command, RobotState, IMU, and FSM
+snapshots over a local Unix datagram socket.  This process writes an immutable
+raw CSV, a separate position-error CSV, and one configuration row.  It never
+constructs or publishes RobotCmd.
 """
 
 import argparse
 import atexit
 import csv
-import math
 import os
 import socket
 import struct
 import sys
-import threading
 import time
-from datetime import datetime, timezone
+from contextlib import ExitStack
+from datetime import datetime
 from pathlib import Path
-
-
-DEPLOY_DIR = Path(__file__).resolve().parent / "tron1-rl-deploy-python"
-if str(DEPLOY_DIR) not in sys.path:
-    sys.path.insert(0, str(DEPLOY_DIR))
-
-import limxsdk.robot.Robot as Robot
-import limxsdk.robot.RobotType as RobotType
 
 
 DEFAULT_ROBOT_TYPE = "WF_TRON1A"
 DEFAULT_RL_TYPE = "isaacgym"
-PACKET = struct.Struct("<4sQ6d")
-FIELDS = (
-    "timestamp_utc",
-    "mode",
-    "pitch_rate",
-    "projected_gravity_x",
-    "raw_policy_wheel_action_left",
-    "raw_policy_wheel_action_right",
-    "sent_wheel_dq_left_rad_s",
-    "sent_wheel_dq_right_rad_s",
-    "measured_wheel_dq_left_rad_s",
-    "measured_wheel_dq_right_rad_s",
+JOINT_NAMES = (
+    "abad_l",
+    "hip_l",
+    "knee_l",
+    "wheel_l",
+    "abad_r",
+    "hip_r",
+    "knee_r",
+    "wheel_r",
 )
-WHEEL_INDICES = (3, 7)
-
-
-class RobotStateReceiver:
-    """Thread-safe holder for the latest SDK RobotState wheel feedback."""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._wheel_dq = None
-        self._received_at = 0.0
-
-    def callback(self, robot_state):
-        dq = list(robot_state.dq)
-        if len(dq) <= WHEEL_INDICES[1]:
-            return
-        wheel_dq = (float(dq[WHEEL_INDICES[0]]), float(dq[WHEEL_INDICES[1]]))
-        with self._lock:
-            self._wheel_dq = wheel_dq
-            self._received_at = time.monotonic()
-
-    def snapshot(self):
-        with self._lock:
-            return self._wheel_dq, self._received_at
+RAW_GROUPS = (
+    ("q_des", "rad"),
+    ("dq_des", "rad_s"),
+    ("q", "rad"),
+    ("dq", "rad_s"),
+    ("tau_feedback", "nm"),
+)
+RAW_NUMERIC_FIELDS = tuple(
+    f"{joint}_{quantity}_{unit}"
+    for quantity, unit in RAW_GROUPS
+    for joint in JOINT_NAMES
+) + (
+    "pitch_deg",
+    "gyro_y_rad_s",
+)
+RAW_FIELDS = (
+    "timestamp_ns",
+    *RAW_NUMERIC_FIELDS,
+    "fsm",
+)
+LEG_INDICES = (0, 1, 2, 4, 5, 6)
+PROCESSED_FIELDS = (
+    "timestamp_ns",
+    *(
+        f"{JOINT_NAMES[index]}_position_error_rad"
+        for index in LEG_INDICES
+    ),
+)
+CONFIG_GROUPS = (
+    ("tau_ff", "nm"),
+    ("kp", "nm_per_rad"),
+    ("kd", "nm_s_per_rad"),
+)
+CONFIG_NUMERIC_FIELDS = tuple(
+    f"{joint}_{quantity}_{unit}"
+    for quantity, unit in CONFIG_GROUPS
+    for joint in JOINT_NAMES
+)
+CONFIG_FIELDS = (
+    "timestamp_ns",
+    "mode",
+    "fsm_at_log_start",
+    *CONFIG_NUMERIC_FIELDS,
+)
+PACKET = struct.Struct("<4sQ32s66d")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Compare the same core policy/control signals in MuJoCo and on "
-            f"hardware (default: {DEFAULT_ROBOT_TYPE}, {DEFAULT_RL_TYPE})."
+            "Record matching high-rate actuator command/response signals in "
+            f"MuJoCo and on hardware (default: {DEFAULT_ROBOT_TYPE}, "
+            f"{DEFAULT_RL_TYPE})."
         )
     )
     parser.add_argument("--mode", choices=("real", "sim"), required=True)
     parser.add_argument(
         "--robot-ip",
         help=(
-            "SDK address; sim defaults to 127.0.0.1, real defaults to "
-            "$ROBOT_IP or 192.168.1.2"
+            "accepted for command compatibility only; the controller owns "
+            "the SDK connection and sends RobotState in each telemetry packet"
         ),
     )
     parser.add_argument(
@@ -92,57 +104,84 @@ def parse_args():
         "--timeout",
         type=float,
         default=10.0,
-        help="seconds to wait for controller and RobotState data (default: 10)",
+        help="seconds to wait for controller telemetry (default: 10)",
     )
     args = parser.parse_args()
     if args.timeout <= 0.0:
         parser.error("--timeout must be greater than zero")
-    if args.robot_ip is None:
-        args.robot_ip = (
-            "127.0.0.1"
-            if args.mode == "sim"
-            else os.environ.get("ROBOT_IP", "192.168.1.2")
-        )
     return args
 
 
-def drain_telemetry(sock, latest):
-    """Drain queued policy snapshots and return the newest valid one."""
+def drain_telemetry(sock):
+    """Return every complete controller snapshot currently queued."""
+    samples = []
     while True:
         try:
             payload = sock.recv(PACKET.size)
         except BlockingIOError:
-            return latest
+            return samples
         if len(payload) != PACKET.size:
             continue
-        magic, timestamp_ns, *values = PACKET.unpack(payload)
-        if magic != b"ZGM1" or not all(math.isfinite(value) for value in values):
+        magic, timestamp_ns, fsm_bytes, *values = PACKET.unpack(payload)
+        if magic != b"ACT1":
             continue
-        latest = (timestamp_ns, values, time.monotonic())
+        fsm = fsm_bytes.split(b"\0", 1)[0].decode(
+            "ascii", errors="replace"
+        )
+        samples.append(
+            (
+                timestamp_ns,
+                fsm,
+                values,
+                time.monotonic(),
+            )
+        )
 
 
-def make_row(mode, telemetry, measured_wheel_dq):
-    timestamp_ns, values, _ = telemetry
-    timestamp = datetime.fromtimestamp(
-        timestamp_ns / 1.0e9,
-        tz=timezone.utc,
-    ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    numeric = [*values, *measured_wheel_dq]
-    formatted = [f"{value:.9f}" for value in numeric]
-    return dict(zip(FIELDS, [timestamp, mode, *formatted]))
+def format_values(values):
+    return [f"{value:.9f}" for value in values]
+
+
+def make_raw_row(telemetry):
+    timestamp_ns, fsm, values, _ = telemetry
+    raw_values = values[:len(RAW_NUMERIC_FIELDS)]
+    return dict(zip(
+        RAW_FIELDS,
+        [str(timestamp_ns), *format_values(raw_values), fsm],
+    ))
+
+
+def make_processed_row(telemetry):
+    timestamp_ns, _, values, _ = telemetry
+    q_des = values[0:8]
+    q_actual = values[16:24]
+    position_error = [
+        q_des[index] - q_actual[index]
+        for index in LEG_INDICES
+    ]
+    return dict(zip(
+        PROCESSED_FIELDS,
+        [str(timestamp_ns), *format_values(position_error)],
+    ))
+
+
+def make_config_row(mode, telemetry):
+    timestamp_ns, fsm, values, _ = telemetry
+    config_values = values[len(RAW_NUMERIC_FIELDS):]
+    return dict(zip(
+        CONFIG_FIELDS,
+        [str(timestamp_ns), mode, fsm, *format_values(config_values)],
+    ))
 
 
 def print_row(row):
     print(
-        f"{row['timestamp_utc']} mode={row['mode']} "
-        f"pitch_rate={row['pitch_rate']} (policy input) "
-        f"projected_gravity_x={row['projected_gravity_x']} "
-        f"raw_policy_wheel_action=[{row['raw_policy_wheel_action_left']}, "
-        f"{row['raw_policy_wheel_action_right']}] "
-        f"sent_wheel_dq=[{row['sent_wheel_dq_left_rad_s']}, "
-        f"{row['sent_wheel_dq_right_rad_s']}] rad/s "
-        f"measured_wheel_dq=[{row['measured_wheel_dq_left_rad_s']}, "
-        f"{row['measured_wheel_dq_right_rad_s']}] rad/s",
+        f"timestamp_ns={row['timestamp_ns']} fsm={row['fsm']} "
+        f"wheel_dq_des=[{row['wheel_l_dq_des_rad_s']}, "
+        f"{row['wheel_r_dq_des_rad_s']}] rad/s "
+        f"wheel_dq=[{row['wheel_l_dq_rad_s']}, "
+        f"{row['wheel_r_dq_rad_s']}] rad/s "
+        f"pitch={row['pitch_deg']} deg gyro_y={row['gyro_y_rad_s']} rad/s",
         flush=True,
     )
 
@@ -151,6 +190,7 @@ def main():
     args = parse_args()
 
     telemetry_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    telemetry_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
     telemetry_socket.setblocking(False)
     telemetry_path = f"/tmp/tron1_zero_gap_{args.mode}.sock"
     if os.path.exists(telemetry_path):
@@ -178,75 +218,108 @@ def main():
 
     atexit.register(cleanup_socket)
 
-    robot = Robot(RobotType.PointFoot)
-    if not robot.init(args.robot_ip):
-        print(f"Error: cannot connect to SDK at {args.robot_ip}", file=sys.stderr)
-        return 1
-
-    receiver = RobotStateReceiver()
-    state_callback = receiver.callback
-    robot.subscribeRobotState(state_callback)
-
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     session = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    csv_path = output_dir / f"zero_gap_{args.mode}_{session}.csv"
+    raw_csv_path = output_dir / f"actuator_raw_{args.mode}_{session}.csv"
+    processed_csv_path = (
+        output_dir / f"actuator_position_error_{args.mode}_{session}.csv"
+    )
+    config_csv_path = (
+        output_dir / f"actuator_config_{args.mode}_{session}.csv"
+    )
 
-    latest_telemetry = None
+    pending_telemetry = []
     deadline = time.monotonic() + args.timeout
     print(
-        f"Waiting for {args.mode} controller telemetry and RobotState at "
-        f"{args.robot_ip} ...",
+        f"Waiting for {args.mode} controller telemetry at {telemetry_path} ...",
         flush=True,
     )
     while True:
-        latest_telemetry = drain_telemetry(telemetry_socket, latest_telemetry)
-        measured_wheel_dq, _ = receiver.snapshot()
-        if latest_telemetry is not None and measured_wheel_dq is not None:
+        pending_telemetry.extend(drain_telemetry(telemetry_socket))
+        if pending_telemetry:
             break
         if time.monotonic() >= deadline:
             print(
-                "Error: timed out waiting for WALK policy telemetry and RobotState; "
+                "Error: timed out waiting for controller telemetry; "
                 "make sure the matching controller is running.",
                 file=sys.stderr,
             )
             return 1
         time.sleep(0.01)
 
-    print(f"CSV: {csv_path}", flush=True)
-    next_sample = time.monotonic()
+    with config_csv_path.open("x", newline="", encoding="utf-8") as config_file:
+        config_writer = csv.DictWriter(config_file, fieldnames=CONFIG_FIELDS)
+        config_writer.writeheader()
+        config_writer.writerow(make_config_row(args.mode, pending_telemetry[0]))
+
+    print(f"Raw CSV: {raw_csv_path}", flush=True)
+    print(f"Position-error CSV: {processed_csv_path}", flush=True)
+    print(f"Configuration CSV: {config_csv_path}", flush=True)
+    print("Recording every controller snapshot at nominal 500 Hz; terminal output is 1 Hz.")
+    next_flush = time.monotonic() + 1.0
+    next_print = time.monotonic()
+    next_stale_warning = time.monotonic()
+    latest_row = None
+    last_telemetry_received_at = pending_telemetry[-1][3]
     try:
-        with csv_path.open("x", newline="", encoding="utf-8") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=FIELDS)
-            writer.writeheader()
-            while True:
-                latest_telemetry = drain_telemetry(
-                    telemetry_socket,
-                    latest_telemetry,
+        with ExitStack() as stack:
+            raw_file = stack.enter_context(
+                raw_csv_path.open("x", newline="", encoding="utf-8")
+            )
+            processed_file = stack.enter_context(
+                processed_csv_path.open(
+                    "x", newline="", encoding="utf-8"
                 )
+            )
+            raw_writer = csv.DictWriter(raw_file, fieldnames=RAW_FIELDS)
+            processed_writer = csv.DictWriter(
+                processed_file, fieldnames=PROCESSED_FIELDS
+            )
+            raw_writer.writeheader()
+            processed_writer.writeheader()
+            while True:
+                if pending_telemetry:
+                    telemetry_batch = pending_telemetry
+                    pending_telemetry = []
+                else:
+                    telemetry_batch = drain_telemetry(telemetry_socket)
+
+                for telemetry in telemetry_batch:
+                    latest_row = make_raw_row(telemetry)
+                    raw_writer.writerow(latest_row)
+                    processed_writer.writerow(make_processed_row(telemetry))
+                if telemetry_batch:
+                    last_telemetry_received_at = telemetry_batch[-1][3]
+
                 now = time.monotonic()
-                if now >= next_sample:
-                    measured_wheel_dq, state_received_at = receiver.snapshot()
-                    telemetry_age = now - latest_telemetry[2]
-                    state_age = now - state_received_at
-                    if telemetry_age > 2.0 or state_age > 2.0:
-                        print(
-                            "Warning: controller telemetry or RobotState is stale; "
-                            "waiting for fresh data.",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                    else:
-                        row = make_row(args.mode, latest_telemetry, measured_wheel_dq)
-                        writer.writerow(row)
-                        csv_file.flush()
-                        print_row(row)
-                    next_sample += 1.0
-                    if next_sample <= now:
-                        next_sample = now + 1.0
-                time.sleep(0.01)
+                telemetry_stale = (
+                    last_telemetry_received_at == 0.0
+                    or now - last_telemetry_received_at > 2.0
+                )
+                if telemetry_stale and now >= next_stale_warning:
+                    print(
+                        "Warning: controller telemetry is stale; "
+                        "waiting for fresh data.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    next_stale_warning = now + 1.0
+
+                if latest_row is not None and now >= next_print:
+                    print_row(latest_row)
+                    next_print = now + 1.0
+
+                if now >= next_flush:
+                    raw_file.flush()
+                    processed_file.flush()
+                    next_flush = now + 1.0
+
+                time.sleep(0.001)
     except KeyboardInterrupt:
-        print(f"\nStopped. CSV saved to: {csv_path}")
+        print(f"\nStopped. Raw CSV saved to: {raw_csv_path}")
+        print(f"Position-error CSV saved to: {processed_csv_path}")
+        print(f"Configuration CSV saved to: {config_csv_path}")
         return 0
 
 

@@ -130,11 +130,20 @@ class WheelfootController:
         self._zero_gap_address = f"/tmp/tron1_zero_gap_{zero_gap_mode}.sock"
         self._zero_gap_socket = None
         self._zero_gap_next_probe = 0.0
-        self._zero_gap_packet = struct.Struct("<4sQ6d")
-        self._zero_gap_pitch_rate = float("nan")
-        self._zero_gap_projected_gravity_x = float("nan")
-        self._zero_gap_raw_wheel_action = np.full(2, np.nan, dtype=float)
-        self._zero_gap_policy_sample_valid = False
+        # Actuator-data snapshots are sent once per 500 Hz control cycle.
+        # The high-rate CSV keeps only the requested command/response fields;
+        # constant tau_ff/Kp/Kd values travel in the packet but are written
+        # once to the session configuration CSV by zero_gap_monitor.py.
+        self._zero_gap_packet = struct.Struct("<4sQ32s66d")
+        self._zero_gap_imu_offset_rotation = R.from_euler(
+            'zyx', self.imu_orientation_offset
+        ).as_matrix()
+
+        self.actuator_collection_start_time = None
+        self.actuator_collection_center_q = None
+        self.actuator_collection_leg_q = None
+        self.actuator_collection_abort_q = None
+        self.actuator_collection_foot_origins = {}
         self.setup_diagnostic_csv()
 
     def setup_file_logger(self):
@@ -446,6 +455,86 @@ class WheelfootController:
         self.policy_session = None  # ONNX model session for policy inference
         self.joint_num = len(self.joint_names)  # number of joints
 
+        # Dedicated actuator-data collection is opt-in.  The values in the
+        # YAML are deliberately inert placeholders, not hardware-safe
+        # defaults derived from the ANYmal experiment.
+        collection_cfg = config['PointfootCfg'].get(
+            'actuator_data_collection', {}
+        )
+        leg_excitation = collection_cfg.get('leg_excitation', {})
+        wheel_excitation = collection_cfg.get('wheel_excitation', {})
+        safety_cfg = collection_cfg.get('safety', {})
+        ik_cfg = collection_cfg.get('ik', {})
+        self.actuator_collection_enabled = bool(
+            collection_cfg.get('enabled', False)
+        )
+        self.actuator_collection_duration = float(
+            collection_cfg.get('duration_s', 0.0)
+        )
+        self.actuator_collection_ramp_duration = float(
+            collection_cfg.get('ramp_duration_s', 1.0)
+        )
+        self.actuator_leg_excitation_enabled = bool(
+            leg_excitation.get('enabled', False)
+        )
+        self.actuator_leg_amplitude = np.asarray(
+            leg_excitation.get('foot_amplitude_m', [0.0, 0.0, 0.0]),
+            dtype=float,
+        )
+        self.actuator_leg_frequency = float(
+            leg_excitation.get('frequency_hz', 0.0)
+        )
+        self.actuator_leg_phase = np.asarray(
+            leg_excitation.get('phase_rad', [0.0, 0.0]),
+            dtype=float,
+        )
+        self.actuator_wheel_excitation_enabled = bool(
+            wheel_excitation.get('enabled', False)
+        )
+        self.actuator_wheel_velocity_amplitude = np.asarray(
+            wheel_excitation.get(
+                'velocity_amplitude_rad_s', [0.0, 0.0]
+            ),
+            dtype=float,
+        )
+        self.actuator_wheel_frequency = float(
+            wheel_excitation.get('frequency_hz', 0.0)
+        )
+        self.actuator_wheel_phase = np.asarray(
+            wheel_excitation.get('phase_rad', [0.0, 0.0]),
+            dtype=float,
+        )
+        self.actuator_collection_tau_ff = np.asarray(
+            collection_cfg.get('tau_ff_nm', [0.0] * self.joint_num),
+            dtype=float,
+        )
+        self.actuator_ik_damping = float(ik_cfg.get('damping', 1.0e-3))
+        self.actuator_ik_tolerance = float(
+            ik_cfg.get('tolerance_m', 1.0e-5)
+        )
+        self.actuator_ik_max_iterations = int(
+            ik_cfg.get('max_iterations', 8)
+        )
+        self.actuator_ik_max_step = float(
+            ik_cfg.get('max_step_rad', 0.10)
+        )
+        self.actuator_joint_margin = float(
+            safety_cfg.get('joint_limit_margin_rad', 0.10)
+        )
+        self.actuator_max_command_speed = float(
+            safety_cfg.get('max_command_speed_rad_s', 0.0)
+        )
+        self.actuator_max_tracking_error = float(
+            safety_cfg.get('max_tracking_error_rad', 0.0)
+        )
+        self.actuator_max_tilt = np.radians(float(
+            safety_cfg.get('max_tilt_deg', 0.0)
+        ))
+        self.actuator_tracking_grace = float(
+            safety_cfg.get('tracking_grace_s', 0.25)
+        )
+        self.validate_actuator_collection_config()
+
         # Updated by the joystick callback and consumed only in WALK.
         self.user_zero_command = True
         self.zero_pitch_comp_active = False
@@ -539,6 +628,381 @@ class WheelfootController:
     def smoothstep(value):
         value = float(np.clip(value, 0.0, 1.0))
         return 10.0 * value**3 - 15.0 * value**4 + 6.0 * value**5
+
+    def validate_actuator_collection_config(self):
+        """Reject incomplete excitation settings before any command is sent."""
+        expected_shapes = (
+            ("leg foot_amplitude_m", self.actuator_leg_amplitude, (3,)),
+            ("leg phase_rad", self.actuator_leg_phase, (2,)),
+            (
+                "wheel velocity_amplitude_rad_s",
+                self.actuator_wheel_velocity_amplitude,
+                (2,),
+            ),
+            ("wheel phase_rad", self.actuator_wheel_phase, (2,)),
+            ("tau_ff_nm", self.actuator_collection_tau_ff, (self.joint_num,)),
+        )
+        for name, value, expected in expected_shapes:
+            if value.shape != expected or not np.all(np.isfinite(value)):
+                raise ValueError(
+                    f"actuator_data_collection {name} must contain "
+                    f"{expected[0]} finite values"
+                )
+
+        if not self.actuator_collection_enabled:
+            return
+        if not (
+            self.actuator_leg_excitation_enabled
+            or self.actuator_wheel_excitation_enabled
+        ):
+            raise ValueError(
+                "actuator_data_collection is enabled but both excitations are disabled"
+            )
+        positive_values = {
+            "duration_s": self.actuator_collection_duration,
+            "ramp_duration_s": self.actuator_collection_ramp_duration,
+            "ik.damping": self.actuator_ik_damping,
+            "ik.tolerance_m": self.actuator_ik_tolerance,
+            "ik.max_step_rad": self.actuator_ik_max_step,
+            "safety.max_command_speed_rad_s": self.actuator_max_command_speed,
+            "safety.max_tracking_error_rad": self.actuator_max_tracking_error,
+            "safety.max_tilt_deg": self.actuator_max_tilt,
+            "safety.joint_limit_margin_rad": self.actuator_joint_margin,
+        }
+        for name, value in positive_values.items():
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"actuator_data_collection {name} must be set above zero"
+                )
+        if self.actuator_ik_max_iterations <= 0:
+            raise ValueError(
+                "actuator_data_collection ik.max_iterations must be positive"
+            )
+        if (
+            not np.isfinite(self.actuator_tracking_grace)
+            or self.actuator_tracking_grace < 0.0
+        ):
+            raise ValueError(
+                "actuator_data_collection safety.tracking_grace_s "
+                "must be nonnegative"
+            )
+        if np.max(np.abs(self.actuator_collection_tau_ff)) > float(
+            self.control_cfg['user_torque_limit']
+        ):
+            raise ValueError(
+                "actuator_data_collection tau_ff_nm exceeds user_torque_limit"
+            )
+        if self.actuator_leg_excitation_enabled:
+            if (
+                not np.isfinite(self.actuator_leg_frequency)
+                or self.actuator_leg_frequency <= 0.0
+            ):
+                raise ValueError(
+                    "leg_excitation.frequency_hz must be set above zero"
+                )
+            if not np.any(np.abs(self.actuator_leg_amplitude) > 0.0):
+                raise ValueError(
+                    "leg_excitation.foot_amplitude_m must excite at least one axis"
+                )
+        if self.actuator_wheel_excitation_enabled:
+            if (
+                not np.isfinite(self.actuator_wheel_frequency)
+                or self.actuator_wheel_frequency <= 0.0
+            ):
+                raise ValueError(
+                    "wheel_excitation.frequency_hz must be set above zero"
+                )
+            if not np.any(
+                np.abs(self.actuator_wheel_velocity_amplitude) > 0.0
+            ):
+                raise ValueError(
+                    "wheel_excitation.velocity_amplitude_rad_s must be nonzero"
+                )
+
+    @staticmethod
+    def actuator_axis_rotation(axis, angle):
+        """Rodrigues rotation used by the URDF-derived three-joint chain."""
+        axis = np.asarray(axis, dtype=float)
+        axis /= np.linalg.norm(axis)
+        cross = np.array([
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0],
+        ])
+        identity = np.eye(3)
+        return (
+            identity * np.cos(angle)
+            + (1.0 - np.cos(angle)) * np.outer(axis, axis)
+            + np.sin(angle) * cross
+        )
+
+    @staticmethod
+    def actuator_leg_description(side):
+        """Return WF_TRON1A joint origins/axes and limits from robot.urdf."""
+        if side == "left":
+            origins = (
+                [0.05556, 0.105, -0.2602],
+                [-0.077, 0.02050, 0.0],
+                [-0.1500, -0.02050, -0.25981],
+            )
+            axes = ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0])
+            wheel_origin = [0.1500, 0.0435, -0.25981]
+            lower = [-0.38397, -1.012291, -0.872665]
+            upper = [1.39626, 1.396263, 1.361357]
+        elif side == "right":
+            origins = (
+                [0.05556, -0.105, -0.2602],
+                [-0.077, -0.02050, 0.0],
+                [-0.1500, 0.02050, -0.25981],
+            )
+            axes = ([1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 1.0, 0.0])
+            wheel_origin = [0.1500, -0.0435, -0.25981]
+            lower = [-1.39626, -1.396263, -1.361357]
+            upper = [0.38397, 1.012291, 0.872665]
+        else:
+            raise ValueError(f"unknown leg side: {side}")
+        return (
+            tuple(np.asarray(value, dtype=float) for value in origins),
+            tuple(np.asarray(value, dtype=float) for value in axes),
+            np.asarray(wheel_origin, dtype=float),
+            np.asarray(lower, dtype=float),
+            np.asarray(upper, dtype=float),
+        )
+
+    def actuator_leg_forward_kinematics(self, side, joint_q):
+        """Wheel-center position and geometric Jacobian in the base frame."""
+        origins, axes, wheel_origin, _, _ = self.actuator_leg_description(side)
+        joint_q = np.asarray(joint_q, dtype=float)
+        position = np.zeros(3, dtype=float)
+        rotation = np.eye(3)
+        joint_positions = []
+        joint_axes = []
+        for origin, axis, angle in zip(origins, axes, joint_q):
+            position = position + rotation @ origin
+            joint_positions.append(position.copy())
+            joint_axes.append(rotation @ axis)
+            rotation = rotation @ self.actuator_axis_rotation(axis, angle)
+        wheel_position = position + rotation @ wheel_origin
+        jacobian = np.column_stack([
+            np.cross(axis, wheel_position - joint_position)
+            for axis, joint_position in zip(joint_axes, joint_positions)
+        ])
+        return wheel_position, jacobian
+
+    def solve_actuator_leg_ik(self, side, target_position, seed_q):
+        """Damped least-squares IK, warm-started from the preceding command."""
+        _, _, _, lower, upper = self.actuator_leg_description(side)
+        lower = lower + self.actuator_joint_margin
+        upper = upper - self.actuator_joint_margin
+        if np.any(lower >= upper):
+            raise ValueError("joint_limit_margin_rad removes the valid IK range")
+
+        q = np.clip(np.asarray(seed_q, dtype=float), lower, upper)
+        target_position = np.asarray(target_position, dtype=float)
+        for _ in range(self.actuator_ik_max_iterations):
+            position, jacobian = self.actuator_leg_forward_kinematics(side, q)
+            error = target_position - position
+            if np.linalg.norm(error) <= self.actuator_ik_tolerance:
+                return q, float(np.linalg.norm(error))
+            regularizer = self.actuator_ik_damping**2 * np.eye(3)
+            try:
+                delta = jacobian.T @ np.linalg.solve(
+                    jacobian @ jacobian.T + regularizer,
+                    error,
+                )
+            except np.linalg.LinAlgError:
+                break
+            max_delta = float(np.max(np.abs(delta)))
+            if max_delta > self.actuator_ik_max_step:
+                delta *= self.actuator_ik_max_step / max_delta
+            q = np.clip(q + delta, lower, upper)
+
+        position, _ = self.actuator_leg_forward_kinematics(side, q)
+        return q, float(np.linalg.norm(target_position - position))
+
+    def begin_actuator_data_collection(self):
+        """Capture the measured stand pose as the zero-amplitude IK reference."""
+        measured_q = np.asarray(
+            self.robot_state_tmp.q, dtype=float
+        )[:self.joint_num].copy()
+        if measured_q.size != self.joint_num or not np.all(np.isfinite(measured_q)):
+            raise ValueError("invalid measured pose at actuator-data handoff")
+
+        self.actuator_collection_center_q = measured_q
+        self.actuator_collection_leg_q = measured_q.copy()
+        self.actuator_collection_abort_q = None
+        for side, indices in (("left", [0, 1, 2]), ("right", [4, 5, 6])):
+            _, _, _, lower, upper = self.actuator_leg_description(side)
+            lower = lower + self.actuator_joint_margin
+            upper = upper - self.actuator_joint_margin
+            if np.any(measured_q[indices] < lower) or np.any(
+                measured_q[indices] > upper
+            ):
+                self.actuator_collection_abort_q = measured_q.copy()
+                self.mode = "ACTUATOR_DATA_ABORT"
+                self.logger.error(
+                    f"Actuator-data ABORT: {side} start pose outside "
+                    "configured joint-limit margin"
+                )
+                return
+        self.actuator_collection_foot_origins = {
+            "left": self.actuator_leg_forward_kinematics(
+                "left", measured_q[[0, 1, 2]]
+            )[0],
+            "right": self.actuator_leg_forward_kinematics(
+                "right", measured_q[[4, 5, 6]]
+            )[0],
+        }
+        self.actuator_collection_start_time = time.monotonic()
+        self.phase_timer = 0.0
+        self.balance_wheel_velocity = 0.0
+        self.mode = "ACTUATOR_DATA"
+        self.logger.info(
+            "KNEE_RELEASE -> ACTUATOR_DATA: explicit data-collection mode"
+        )
+
+    def abort_actuator_data_collection(self, reason):
+        """Stop every excitation and hold the measured leg pose."""
+        measured_q = np.asarray(
+            self.robot_state_tmp.q, dtype=float
+        )[:self.joint_num].copy()
+        if measured_q.size != self.joint_num or not np.all(np.isfinite(measured_q)):
+            measured_q = self.actuator_collection_center_q.copy()
+        self.actuator_collection_abort_q = measured_q
+        self.mode = "ACTUATOR_DATA_ABORT"
+        self.logger.error(f"Actuator-data ABORT: {reason}")
+
+    def actuator_data_safety_reason(self, elapsed):
+        q = np.asarray(self.robot_state_tmp.q, dtype=float)[:self.joint_num]
+        dq = np.asarray(self.robot_state_tmp.dq, dtype=float)[:self.joint_num]
+        if q.size != self.joint_num or dq.size != self.joint_num:
+            return "incomplete joint feedback"
+        if not np.all(np.isfinite(q)) or not np.all(np.isfinite(dq)):
+            return "non-finite joint feedback"
+        if np.max(np.abs(dq)) > self.actuator_max_command_speed:
+            return "measured joint speed limit exceeded"
+        _, _, _, _, tilt = self.get_full_orientation_state()
+        if not np.isfinite(tilt) or tilt > self.actuator_max_tilt:
+            return "body tilt limit exceeded"
+        if (
+            self.actuator_leg_excitation_enabled
+            and elapsed >= self.actuator_tracking_grace
+        ):
+            legs = self.get_leg_indices()
+            error = np.max(np.abs(q[legs] - self.actuator_collection_leg_q[legs]))
+            if error > self.actuator_max_tracking_error:
+                return "leg tracking error limit exceeded"
+        return ""
+
+    def command_actuator_collection_hold(self, hold_q):
+        """Use the experiment's constant gains/torque while all sine terms are zero."""
+        wheel_indices = set(self.get_wheel_indices())
+        for index in range(self.joint_num):
+            if index in wheel_indices:
+                self.set_joint_command(
+                    index, 0.0, 0.0,
+                    self.actuator_collection_tau_ff[index],
+                    0.0, self.wheel_joint_damping,
+                )
+            else:
+                self.set_joint_command(
+                    index, hold_q[index], 0.0,
+                    self.actuator_collection_tau_ff[index],
+                    self.control_cfg['stiffness'],
+                    self.control_cfg['damping'],
+                )
+
+    def handle_actuator_data_collection(self):
+        """Generate optional leg-IK and wheel-velocity sine references."""
+        if self.mode == "ACTUATOR_DATA_ABORT":
+            self.command_actuator_collection_hold(self.actuator_collection_abort_q)
+            return
+        if self.mode == "ACTUATOR_DATA_HOLD":
+            self.command_actuator_collection_hold(self.actuator_collection_center_q)
+            return
+
+        elapsed = time.monotonic() - self.actuator_collection_start_time
+        reason = self.actuator_data_safety_reason(elapsed)
+        if reason:
+            self.abort_actuator_data_collection(reason)
+            self.command_actuator_collection_hold(self.actuator_collection_abort_q)
+            return
+        if elapsed >= self.actuator_collection_duration:
+            self.mode = "ACTUATOR_DATA_HOLD"
+            self.logger.info("Actuator-data excitation completed; holding reference pose")
+            self.command_actuator_collection_hold(self.actuator_collection_center_q)
+            return
+
+        ramp_in = self.smoothstep(
+            elapsed / self.actuator_collection_ramp_duration
+        )
+        ramp_out = self.smoothstep(
+            (self.actuator_collection_duration - elapsed)
+            / self.actuator_collection_ramp_duration
+        )
+        envelope = min(ramp_in, ramp_out)
+        previous_q = self.actuator_collection_leg_q.copy()
+        next_q = self.actuator_collection_center_q.copy()
+
+        if self.actuator_leg_excitation_enabled:
+            for side, indices, phase in (
+                ("left", [0, 1, 2], self.actuator_leg_phase[0]),
+                ("right", [4, 5, 6], self.actuator_leg_phase[1]),
+            ):
+                angle = 2.0 * np.pi * self.actuator_leg_frequency * elapsed + phase
+                target = (
+                    self.actuator_collection_foot_origins[side]
+                    + envelope * self.actuator_leg_amplitude * np.sin(angle)
+                )
+                solved_q, residual = self.solve_actuator_leg_ik(
+                    side, target, previous_q[indices]
+                )
+                if residual > self.actuator_ik_tolerance:
+                    self.abort_actuator_data_collection(
+                        f"{side} IK residual {residual:.6f} m"
+                    )
+                    self.command_actuator_collection_hold(
+                        self.actuator_collection_abort_q
+                    )
+                    return
+                next_q[indices] = solved_q
+
+        leg_dq = (next_q - previous_q) * self.loop_frequency
+        legs = self.get_leg_indices()
+        if np.max(np.abs(leg_dq[legs])) > self.actuator_max_command_speed:
+            self.abort_actuator_data_collection("commanded leg speed limit exceeded")
+            self.command_actuator_collection_hold(self.actuator_collection_abort_q)
+            return
+
+        wheel_indices = self.get_wheel_indices()
+        wheel_dq = np.zeros(2, dtype=float)
+        if self.actuator_wheel_excitation_enabled:
+            wheel_dq = envelope * self.actuator_wheel_velocity_amplitude * np.sin(
+                2.0 * np.pi * self.actuator_wheel_frequency * elapsed
+                + self.actuator_wheel_phase
+            )
+            if np.max(np.abs(wheel_dq)) > self.actuator_max_command_speed:
+                self.abort_actuator_data_collection(
+                    "commanded wheel speed limit exceeded"
+                )
+                self.command_actuator_collection_hold(
+                    self.actuator_collection_abort_q
+                )
+                return
+
+        for index in legs:
+            self.set_joint_command(
+                index, next_q[index], leg_dq[index],
+                self.actuator_collection_tau_ff[index],
+                self.control_cfg['stiffness'], self.control_cfg['damping'],
+            )
+        for wheel_slot, index in enumerate(wheel_indices):
+            self.set_joint_command(
+                index, 0.0, wheel_dq[wheel_slot],
+                self.actuator_collection_tau_ff[index],
+                0.0, self.wheel_joint_damping,
+            )
+        self.actuator_collection_leg_q = next_q
 
     def get_pitch_state(self):
         """Return pitch and pitch rate using the same IMU convention as observations."""
@@ -1403,6 +1867,11 @@ class WheelfootController:
             )
 
             if self.knee_handoff_ready():
+                if self.actuator_collection_enabled:
+                    self.begin_actuator_data_collection()
+                    self.handle_actuator_data_collection()
+                    return
+
                 fsm_q = np.asarray(
                     self.robot_cmd.q, dtype=float
                 )[:self.joint_num].copy()
@@ -1681,12 +2150,7 @@ class WheelfootController:
             self.log_walk_diagnostic()
 
     def publish_zero_gap_snapshot(self):
-        """Non-blocking, read-only telemetry for zero_gap_monitor.py."""
-        if not self._zero_gap_policy_sample_valid:
-            return
-        if self.loop_count % self.control_cfg["decimation"] != 0:
-            return
-
+        """Send one non-blocking actuator-data sample per control cycle."""
         now = time.monotonic()
         if self._zero_gap_socket is None:
             if now < self._zero_gap_next_probe:
@@ -1697,19 +2161,89 @@ class WheelfootController:
             )
             self._zero_gap_socket.setblocking(False)
 
-        wheel_indices = self.get_wheel_indices()
-        if len(wheel_indices) != 2:
+        command_arrays = (
+            self.robot_cmd.q,
+            self.robot_cmd.dq,
+            self.robot_cmd.tau,
+            self.robot_cmd.Kp,
+            self.robot_cmd.Kd,
+        )
+        state_arrays = (
+            self.robot_state_tmp.q,
+            self.robot_state_tmp.dq,
+            self.robot_state_tmp.tau,
+        )
+        if any(len(values) < self.joint_num for values in command_arrays):
             return
-        sent_wheel_dq = [self.robot_cmd.dq[i] for i in wheel_indices]
+        if any(len(values) < self.joint_num for values in state_arrays):
+            return
+
+        quat = np.asarray(self.imu_data_tmp.quat, dtype=float)
+        gyro = np.asarray(self.imu_data_tmp.gyro, dtype=float)[:3]
+        pitch = float("nan")
+        gyro_y = float("nan")
+        if (
+            quat.size == 4
+            and gyro.size == 3
+            and np.all(np.isfinite(quat))
+            and np.all(np.isfinite(gyro))
+        ):
+            quat_norm = np.linalg.norm(quat)
+            if quat_norm > 1.0e-6:
+                gravity = R.from_quat(quat / quat_norm).inv().apply(
+                    np.array([0.0, 0.0, -1.0])
+                )
+                gravity = self._zero_gap_imu_offset_rotation @ gravity
+                gyro = self._zero_gap_imu_offset_rotation @ gyro
+                pitch = float(np.degrees(np.arctan2(gravity[0], -gravity[2])))
+                gyro_y = float(gyro[1])
+
+        q_des = [float(value) for value in self.robot_cmd.q[:self.joint_num]]
+        dq_des = [float(value) for value in self.robot_cmd.dq[:self.joint_num]]
+        if self.actuator_collection_enabled:
+            wheel_indices = set(self.get_wheel_indices())
+            tau_ff = self.actuator_collection_tau_ff.tolist()
+            kp = [
+                0.0 if index in wheel_indices
+                else float(self.control_cfg['stiffness'])
+                for index in range(self.joint_num)
+            ]
+            kd = [
+                float(self.wheel_joint_damping) if index in wheel_indices
+                else float(self.control_cfg['damping'])
+                for index in range(self.joint_num)
+            ]
+        else:
+            tau_ff = [
+                float(value) for value in self.robot_cmd.tau[:self.joint_num]
+            ]
+            kp = [float(value) for value in self.robot_cmd.Kp[:self.joint_num]]
+            kd = [float(value) for value in self.robot_cmd.Kd[:self.joint_num]]
+        q_actual = [
+            float(value) for value in self.robot_state_tmp.q[:self.joint_num]
+        ]
+        dq_actual = [
+            float(value) for value in self.robot_state_tmp.dq[:self.joint_num]
+        ]
+        tau_feedback = [
+            float(value) for value in self.robot_state_tmp.tau[:self.joint_num]
+        ]
+        fsm = self.mode.encode("ascii", errors="replace")[:31]
+
         packet = self._zero_gap_packet.pack(
-            b"ZGM1",
+            b"ACT1",
             time.time_ns(),
-            self._zero_gap_pitch_rate,
-            self._zero_gap_projected_gravity_x,
-            self._zero_gap_raw_wheel_action[0],
-            self._zero_gap_raw_wheel_action[1],
-            sent_wheel_dq[0],
-            sent_wheel_dq[1],
+            fsm,
+            *q_des,
+            *dq_des,
+            *q_actual,
+            *dq_actual,
+            *tau_feedback,
+            pitch,
+            gyro_y,
+            *tau_ff,
+            *kp,
+            *kd,
         )
         try:
             self._zero_gap_socket.sendto(packet, self._zero_gap_address)
@@ -2054,6 +2588,10 @@ class WheelfootController:
             self.handle_rl_blend()
         elif self.mode == "WALK":
             self.handle_walk_mode()
+        elif self.mode in {
+            "ACTUATOR_DATA", "ACTUATOR_DATA_HOLD", "ACTUATOR_DATA_ABORT"
+        }:
+            self.handle_actuator_data_collection()
 
         self.publish_zero_gap_snapshot()
         self.loop_count += 1
