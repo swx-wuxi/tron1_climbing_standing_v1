@@ -345,7 +345,15 @@ def _make_model_xml_with_terrains(model_path):
     return terrain_model_path
 
 class SimulatorMujoco:
-    def __init__(self, asset_path, joint_sensor_names, robot, initial_qpos=None):
+    def __init__(
+        self,
+        asset_path,
+        joint_sensor_names,
+        robot,
+        initial_qpos=None,
+        wheel_actuator_checkpoint=None,
+        reference_actuator_checkpoints=None,
+    ):
         self.robot = robot
         self.joint_sensor_names = joint_sensor_names
         self.joint_num = len(joint_sensor_names)
@@ -353,6 +361,31 @@ class SimulatorMujoco:
         # Load the MuJoCo model and data from the specified XML asset path
         self.mujoco_model = mujoco.MjModel.from_xml_path(asset_path)
         self.mujoco_data = mujoco.MjData(self.mujoco_model)
+        self.wheel_actuator_network = None
+        self.actuator_networks = []
+        self.wheel_actuator_network_enabled = False
+        if wheel_actuator_checkpoint is not None:
+            from wheel_actuator_network import WheelActuatorNetwork
+
+            self.wheel_actuator_network = WheelActuatorNetwork(
+                wheel_actuator_checkpoint,
+                joint_sensor_names,
+                self.mujoco_model.opt.timestep,
+            )
+            self.actuator_networks.append(self.wheel_actuator_network)
+            print("*** Press N in the MuJoCo window to enable/disable it. ***")
+        if reference_actuator_checkpoints:
+            from wheel_actuator_network import WheelActuatorNetwork
+
+            for checkpoint in reference_actuator_checkpoints:
+                self.actuator_networks.append(
+                    WheelActuatorNetwork(
+                        checkpoint,
+                        joint_sensor_names,
+                        self.mujoco_model.opt.timestep,
+                    )
+                )
+            print("*** Press N in the MuJoCo window to enable/disable all reference actuator networks. ***")
         print("\n========== MUJOCO ACTUATOR MAP ==========")
         for i in range(self.mujoco_model.nu):
             aname = mujoco.mj_id2name(
@@ -430,7 +463,20 @@ class SimulatorMujoco:
 
     # Callback for keypress events in the MuJoCo viewer
     def key_callback(self, keycode):
-        pass
+        if not self.actuator_networks or keycode != ord("N"):
+            return
+        self.wheel_actuator_network_enabled = not self.wheel_actuator_network_enabled
+        # Keep the timestamped buffer collected while inactive so enabling the
+        # network never starts from repeated/padded history values.
+        for actuator_network in self.actuator_networks:
+            actuator_network.reset(clear_history=False)
+        state = "ENABLED" if self.wheel_actuator_network_enabled else "DISABLED"
+        if (
+            self.wheel_actuator_network_enabled
+            and not all(network.histories_ready() for network in self.actuator_networks)
+        ):
+            state += " (warming up on baseline torque)"
+        print(f"*** EXPERIMENTAL wheel actuator network {state} ***")
 
     def run(self):
         frame_count = 0
@@ -454,11 +500,37 @@ class SimulatorMujoco:
                 self.robot_state.tau[i] = self.mujoco_data.ctrl[i]
 
                 # Apply control commands to the robot based on the received robot command data
-                self.mujoco_data.ctrl[i] = (
+                baseline_torque = (
                     self.robot_cmd.Kp[i] * (self.robot_cmd.q[i] - self.robot_state.q[i]) +
                     self.robot_cmd.Kd[i] * (self.robot_cmd.dq[i] - self.robot_state.dq[i]) +
                     self.robot_cmd.tau[i]
                 )
+                actuator_network = next(
+                    (network for network in self.actuator_networks if network.handles(i)),
+                    None,
+                )
+                if actuator_network is not None:
+                    desired_value = (
+                        self.robot_cmd.dq[i]
+                        if actuator_network.tracking_error_type == "velocity"
+                        else self.robot_cmd.q[i]
+                    )
+                    actuator_network.observe(
+                        i,
+                        self.mujoco_data.time,
+                        desired_value,
+                        self.robot_state.dq[i],
+                        self.robot_state.q[i],
+                    )
+
+                if self.wheel_actuator_network_enabled and actuator_network is not None:
+                    self.mujoco_data.ctrl[i] = actuator_network.torque(
+                        i,
+                        frame_count,
+                        baseline_torque,
+                    )
+                else:
+                    self.mujoco_data.ctrl[i] = baseline_torque
             
             # Set the timestamp for the current robot state and publish it
             self.robot_state.stamp = time.time_ns()
@@ -535,12 +607,32 @@ if __name__ == '__main__':
         metavar="FILE",
         help="load qpos from a pose JSON file before normal simulation starts",
     )
+    parser.add_argument(
+        "--wheel-actuator-network",
+        action="store_true",
+        help=(
+            "load the experimental wheel actuator network inactive; press N "
+            "in the MuJoCo window to toggle it"
+        ),
+    )
+    parser.add_argument(
+        "--reference-actuator-network",
+        action="store_true",
+        help=(
+            "load reference-style leg and wheel actuator networks inactive; "
+            "press N in the MuJoCo window to toggle them"
+        ),
+    )
     args = parser.parse_args()
 
     if args.save_pose and not args.manual_edit:
         parser.error("--save-pose must be used together with --manual-edit")
     if args.manual_edit and args.load_pose:
         parser.error("--load-pose is for normal simulation mode, not --manual-edit")
+    if args.manual_edit and (args.wheel_actuator_network or args.reference_actuator_network):
+        parser.error("actuator networks are unavailable in --manual-edit mode")
+    if args.wheel_actuator_network and args.reference_actuator_network:
+        parser.error("select either --wheel-actuator-network or --reference-actuator-network")
 
     robot_type = os.getenv("ROBOT_TYPE")
 
@@ -650,11 +742,39 @@ if __name__ == '__main__':
             "knee_R_Joint"
         ]
 
+    wheel_actuator_checkpoint = None
+    reference_actuator_checkpoints = None
+    if args.wheel_actuator_network:
+        if not robot_type.startswith("WF"):
+            parser.error("--wheel-actuator-network requires a WF robot type")
+        wheel_actuator_checkpoint = os.path.join(
+            os.path.dirname(script_dir),
+            "tron1-rl-deploy-python",
+            "actuator_network",
+            "outputs",
+            "best_wheel_actuator_v2.pt",
+        )
+    if args.reference_actuator_network:
+        if not robot_type.startswith("WF"):
+            parser.error("--reference-actuator-network requires a WF robot type")
+        checkpoint_dir = os.path.join(
+            os.path.dirname(script_dir),
+            "tron1-rl-deploy-python",
+            "actuator_network",
+            "outputs",
+        )
+        reference_actuator_checkpoints = [
+            os.path.join(checkpoint_dir, "best_reference_legs_actuator.pt"),
+            os.path.join(checkpoint_dir, "best_reference_wheels_actuator.pt"),
+        ]
+
     # Create and run the MuJoCo simulator instance
     simulator = SimulatorMujoco(
         model_path,
         joint_sensor_names,
         robot,
         initial_qpos=initial_qpos,
+        wheel_actuator_checkpoint=wheel_actuator_checkpoint,
+        reference_actuator_checkpoints=reference_actuator_checkpoints,
     )
     simulator.run()

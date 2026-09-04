@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the first history-based TRON1 wheel actuator network."""
+"""Train V1 or timestamp-sampled V2 of the TRON1 wheel actuator network."""
 
 from __future__ import annotations
 
@@ -33,12 +33,14 @@ from actuator_model import make_model
 
 # All first-version experiment settings are intentionally centralized here.
 DEFAULT_CSV = Path(
-    "/home/air/Desktop/sim2real_data/0902data/"
-    "actuator_raw_real_20241023_161025_043119.csv"
+    "/home/air/swx_tron1/tron1-rl-deploy-python/input_raw_realdata"
+    "/Raw_v1.csv"
 )
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 TARGET_MODE = "auto"  # auto selects torque when both wheel torque fields are usable
 HISTORY_LENGTH = 8
+V2_HISTORY_OFFSETS_MS = (0.0, 10.0, 20.0, 30.0, 40.0)
+V2_TIMESTAMP_TOLERANCE_MS = 2.5
 TRAIN_FRACTION = 0.80
 MINIMUM_DT_MS = 0.25
 MAXIMUM_GAP_MS = 5.0
@@ -59,6 +61,16 @@ def parse_args() -> argparse.Namespace:
         "--target-mode",
         choices=("auto", "torque", "next_velocity"),
         default=TARGET_MODE,
+        help="V1 target selection; V2 always requires measured torque",
+    )
+    parser.add_argument(
+        "--history-version",
+        choices=("v1", "v2"),
+        default="v2",
+        help=(
+            "v1 uses consecutive rows; v2 matches 0/-10/-20/-30/-40 ms "
+            "against real timestamps"
+        ),
     )
     parser.add_argument("--history", type=int, default=HISTORY_LENGTH)
     parser.add_argument("--epochs", type=int, default=EPOCHS)
@@ -148,22 +160,53 @@ def main() -> int:
     device = choose_device(args.device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    session = load_wheel_csv(args.csv, target_mode=args.target_mode)
+    if args.history_version == "v2" and args.target_mode == "next_velocity":
+        raise ValueError("V2 target is fixed to measured wheel torque")
+
+    target_mode = "torque" if args.history_version == "v2" else args.target_mode
+    history_offsets_s = (
+        tuple(offset_ms / 1000.0 for offset_ms in V2_HISTORY_OFFSETS_MS)
+        if args.history_version == "v2"
+        else None
+    )
+    history_length = (
+        len(V2_HISTORY_OFFSETS_MS)
+        if args.history_version == "v2"
+        else args.history
+    )
+    history_order = (
+        "current_to_oldest"
+        if args.history_version == "v2"
+        else "oldest_to_current"
+    )
+    timestamp_tolerance_s = (
+        V2_TIMESTAMP_TOLERANCE_MS / 1000.0
+        if args.history_version == "v2"
+        else None
+    )
+
+    session = load_wheel_csv(args.csv, target_mode=target_mode)
     train_examples = build_examples(
         session,
-        history_length=args.history,
+        history_length=history_length,
         train_fraction=TRAIN_FRACTION,
         subset="train",
         minimum_dt_s=MINIMUM_DT_MS / 1000.0,
         maximum_gap_s=MAXIMUM_GAP_MS / 1000.0,
+        history_offsets_s=history_offsets_s,
+        history_order=history_order,
+        timestamp_tolerance_s=timestamp_tolerance_s,
     )
     val_examples = build_examples(
         session,
-        history_length=args.history,
+        history_length=history_length,
         train_fraction=TRAIN_FRACTION,
         subset="val",
         minimum_dt_s=MINIMUM_DT_MS / 1000.0,
         maximum_gap_s=MAXIMUM_GAP_MS / 1000.0,
+        history_offsets_s=history_offsets_s,
+        history_order=history_order,
+        timestamp_tolerance_s=timestamp_tolerance_s,
     )
     normalization = fit_normalization(train_examples)
     train_x, train_y = normalize_examples(train_examples, normalization)
@@ -176,11 +219,33 @@ def main() -> int:
         f"Rows: source={session.source_rows}, valid={session.valid_rows}, "
         f"median_dt={session.median_dt_s * 1000.0:.4f} ms"
     )
-    print(
-        f"Target={session.target_mode}, history={args.history} frames "
-        f"(~{(args.history - 1) * session.median_dt_s * 1000.0:.2f} ms), "
-        f"input_dim={train_x.shape[1]}"
-    )
+    if args.history_version == "v2":
+        offset_text = ", ".join(
+            f"-{offset_ms:g}" if offset_ms else "0"
+            for offset_ms in V2_HISTORY_OFFSETS_MS
+        )
+        print(
+            f"Target=measured torque at 0 ms, history=v2 [{offset_text}] ms "
+            f"(current-to-oldest), input_dim={train_x.shape[1]}"
+        )
+        for subset_name, examples in (
+            ("train", train_examples),
+            ("val", val_examples),
+        ):
+            assert examples.history_match_errors_s is not None
+            absolute_errors_ms = np.abs(examples.history_match_errors_s) * 1000.0
+            print(
+                f"  {subset_name} timestamp match: "
+                f"mean_abs={absolute_errors_ms.mean():.4f} ms, "
+                f"max_abs={absolute_errors_ms.max():.4f} ms, "
+                f"tolerance={V2_TIMESTAMP_TOLERANCE_MS:.4f} ms"
+            )
+    else:
+        print(
+            f"Target={session.target_mode}, history=v1 {history_length} consecutive "
+            f"frames (~{(history_length - 1) * session.median_dt_s * 1000.0:.2f} ms, "
+            f"oldest-to-current), input_dim={train_x.shape[1]}"
+        )
     print(
         f"Examples: train={len(train_x)} (rejected={train_examples.rejected_windows}), "
         f"val={len(val_x)} (rejected={val_examples.rejected_windows})"
@@ -205,7 +270,9 @@ def main() -> int:
     )
     criterion = nn.MSELoss()
 
-    checkpoint_path = args.output_dir / "best_wheel_actuator.pt"
+    checkpoint_path = (
+        args.output_dir / f"best_wheel_actuator_{args.history_version}.pt"
+    )
     best_val_loss = float("inf")
     epochs_without_improvement = 0
     for epoch in range(1, args.epochs + 1):
@@ -257,16 +324,30 @@ def main() -> int:
             epochs_without_improvement = 0
             torch.save(
                 {
-                    "format_version": 1,
+                    "format_version": 2 if args.history_version == "v2" else 1,
                     "model_state_dict": model.state_dict(),
                     "input_dim": train_x.shape[1],
                     "hidden_sizes": list(HIDDEN_SIZES),
-                    "history_length": args.history,
+                    "history_length": history_length,
+                    "history_version": args.history_version,
+                    "history_offsets_s": (
+                        list(history_offsets_s)
+                        if history_offsets_s is not None
+                        else None
+                    ),
+                    "history_order": history_order,
+                    "timestamp_tolerance_s": timestamp_tolerance_s,
                     "feature_order": [
-                        "dq_actual_oldest_to_current",
-                        "dq_des_minus_dq_actual_oldest_to_current",
+                        f"dq_actual_{history_order}",
+                        f"dq_des_minus_dq_actual_{history_order}",
                     ],
                     "target_mode": session.target_mode,
+                    "target_row_offset": (
+                        0 if session.target_mode == "torque" else 1
+                    ),
+                    "target_offset_s": (
+                        0.0 if session.target_mode == "torque" else None
+                    ),
                     "input_mean": torch.from_numpy(normalization.input_mean),
                     "input_std": torch.from_numpy(normalization.input_std),
                     "target_mean": torch.from_numpy(normalization.target_mean),
@@ -303,7 +384,10 @@ def main() -> int:
     print(f"Best validation: MAE={val_mae:.6f}, RMSE={val_rmse:.6f} {unit}")
     print_side_metrics(val_examples, val_predictions, unit)
 
-    plot_path = args.output_dir / "validation_predicted_vs_actual.png"
+    plot_path = (
+        args.output_dir
+        / f"validation_predicted_vs_actual_{args.history_version}.png"
+    )
     save_prediction_plot(
         plot_path,
         val_examples,
@@ -318,4 +402,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

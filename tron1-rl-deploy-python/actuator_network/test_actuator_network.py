@@ -56,9 +56,11 @@ def predict_one(
 ) -> float:
     """Minimal inference example for one wheel.
 
-    Histories must be oldest-to-current and have checkpoint history_length
-    values.  A torque checkpoint returns Nm; a next_velocity checkpoint returns
-    the next measured wheel velocity in rad/s.
+    Histories must follow the checkpoint's ``history_order`` and contain
+    ``history_length`` values.  V1 uses oldest-to-current; V2 uses the sampled
+    0/-10/-20/-30/-40 ms values in current-to-oldest order.  A torque
+    checkpoint returns Nm; a next_velocity checkpoint returns the next measured
+    wheel velocity in rad/s.
     """
 
     desired = np.asarray(desired_dq_history, dtype=np.float32).reshape(-1)
@@ -88,6 +90,13 @@ def main() -> int:
         subset="val",
         minimum_dt_s=float(checkpoint["minimum_dt_s"]),
         maximum_gap_s=float(checkpoint["maximum_gap_s"]),
+        history_offsets_s=(
+            tuple(checkpoint["history_offsets_s"])
+            if checkpoint.get("history_offsets_s") is not None
+            else None
+        ),
+        history_order=checkpoint.get("history_order", "oldest_to_current"),
+        timestamp_tolerance_s=checkpoint.get("timestamp_tolerance_s"),
     )
 
     input_mean = checkpoint["input_mean"].numpy()
@@ -143,4 +152,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

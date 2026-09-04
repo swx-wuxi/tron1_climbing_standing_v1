@@ -14,6 +14,7 @@ from torch.utils.data import Dataset
 
 
 TargetMode = Literal["auto", "torque", "next_velocity"]
+HistoryOrder = Literal["oldest_to_current", "current_to_oldest"]
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,8 @@ class WheelExamples:
     inputs: np.ndarray
     targets: np.ndarray
     timestamps_s: np.ndarray
+    history_timestamps_s: np.ndarray
+    history_match_errors_s: np.ndarray | None
     side_ids: np.ndarray
     rejected_windows: int
 
@@ -302,8 +305,17 @@ def build_examples(
     subset: Literal["train", "val"],
     minimum_dt_s: float,
     maximum_gap_s: float,
+    history_offsets_s: tuple[float, ...] | None = None,
+    history_order: HistoryOrder = "oldest_to_current",
+    timestamp_tolerance_s: float | None = None,
 ) -> WheelExamples:
-    """Build left/right examples after a continuous-in-time row split."""
+    """Build left/right examples after a continuous-in-time row split.
+
+    With ``history_offsets_s=None`` this retains the V1 behavior: consecutive
+    rows are returned oldest-to-current.  Otherwise offsets are non-negative
+    ages relative to the target row (0 means the target timestamp), and each
+    age is matched against the real timestamps rather than a row stride.
+    """
 
     if not 2 <= history_length <= 100:
         raise ValueError("history_length must be between 2 and 100")
@@ -311,6 +323,30 @@ def build_examples(
         raise ValueError("train_fraction must be between 0.5 and 0.95")
     if not 0.0 <= minimum_dt_s < maximum_gap_s:
         raise ValueError("Expected 0 <= minimum_dt_s < maximum_gap_s")
+    if history_order not in {"oldest_to_current", "current_to_oldest"}:
+        raise ValueError(f"Unsupported history_order: {history_order}")
+
+    timestamp_history = history_offsets_s is not None
+    if timestamp_history:
+        offsets = np.asarray(history_offsets_s, dtype=np.float64)
+        if offsets.ndim != 1 or len(offsets) != history_length:
+            raise ValueError(
+                "history_offsets_s must contain exactly history_length values"
+            )
+        if not np.all(np.isfinite(offsets)) or np.any(offsets < 0.0):
+            raise ValueError("history_offsets_s must be finite and non-negative")
+        if not np.isclose(offsets[0], 0.0, atol=1.0e-12):
+            raise ValueError("history_offsets_s must start with the current (0 s) age")
+        if np.any(np.diff(offsets) <= 0.0):
+            raise ValueError("history_offsets_s ages must be strictly increasing")
+        if timestamp_tolerance_s is None or timestamp_tolerance_s <= 0.0:
+            raise ValueError(
+                "timestamp_tolerance_s must be positive for timestamp histories"
+            )
+    else:
+        offsets = np.empty(0, dtype=np.float64)
+        if history_order != "oldest_to_current":
+            raise ValueError("V1 contiguous history must remain oldest_to_current")
 
     row_count = len(session.timestamp_s)
     split_row = int(row_count * train_fraction)
@@ -325,34 +361,121 @@ def build_examples(
     inputs: list[np.ndarray] = []
     targets: list[float] = []
     timestamps: list[float] = []
+    history_timestamps: list[np.ndarray] = []
+    history_match_errors: list[np.ndarray] = []
     side_ids: list[int] = []
     rejected = 0
+
+    segment_timestamps = session.timestamp_s[segment_start:segment_stop]
+
+    def nearest_segment_row(requested_timestamp: float) -> int:
+        """Return the closest row, preferring the earlier row on an exact tie."""
+
+        insertion = int(np.searchsorted(segment_timestamps, requested_timestamp))
+        candidates: list[int] = []
+        if insertion > 0:
+            candidates.append(insertion - 1)
+        if insertion < len(segment_timestamps):
+            candidates.append(insertion)
+        local_index = min(
+            candidates,
+            key=lambda index: (
+                abs(segment_timestamps[index] - requested_timestamp),
+                segment_timestamps[index],
+            ),
+        )
+        return segment_start + local_index
 
     for side_id in (0, 1):
         desired = session.dq_des[:, side_id]
         actual = session.dq[:, side_id]
         velocity_error = desired - actual
-        last_history_end = (
-            segment_stop - 1
-            if session.target_mode == "torque"
-            else segment_stop - 2
-        )
-        for history_end in range(segment_start + history_length - 1, last_history_end + 1):
-            history_start = history_end - history_length + 1
-            transition_stop = history_end if session.target_mode == "torque" else history_end + 1
-            if not np.all(transition_ok[history_start:transition_stop]):
-                rejected += 1
-                continue
+        last_history_end = segment_stop - (1 if session.target_mode == "torque" else 2)
+        first_history_end = segment_start + history_length - 1
+        if timestamp_history:
+            first_history_end = int(
+                np.searchsorted(
+                    session.timestamp_s,
+                    session.timestamp_s[segment_start] + offsets[-1],
+                    side="left",
+                )
+            )
+            first_history_end = max(segment_start, first_history_end)
+
+        for history_end in range(first_history_end, last_history_end + 1):
+            if timestamp_history:
+                current_timestamp = float(session.timestamp_s[history_end])
+                requested_current_to_oldest = current_timestamp - offsets
+                indices_current_to_oldest = np.asarray(
+                    [
+                        history_end
+                        if age == 0.0
+                        else nearest_segment_row(float(requested))
+                        for age, requested in zip(
+                            offsets, requested_current_to_oldest
+                        )
+                    ],
+                    dtype=np.int64,
+                )
+                matched_current_to_oldest = session.timestamp_s[
+                    indices_current_to_oldest
+                ]
+                errors_current_to_oldest = (
+                    matched_current_to_oldest - requested_current_to_oldest
+                )
+                indices_are_causal = (
+                    indices_current_to_oldest[0] == history_end
+                    and np.all(np.diff(indices_current_to_oldest) < 0)
+                )
+                within_tolerance = np.all(
+                    np.abs(errors_current_to_oldest)
+                    <= float(timestamp_tolerance_s) + 1.0e-12
+                )
+                oldest_row = int(indices_current_to_oldest[-1])
+                transition_stop = (
+                    history_end
+                    if session.target_mode == "torque"
+                    else history_end + 1
+                )
+                continuous = np.all(transition_ok[oldest_row:transition_stop])
+                if not (indices_are_causal and within_tolerance and continuous):
+                    rejected += 1
+                    continue
+
+                if history_order == "current_to_oldest":
+                    history_indices = indices_current_to_oldest
+                    matched_timestamps = matched_current_to_oldest
+                    match_errors = errors_current_to_oldest
+                else:
+                    history_indices = indices_current_to_oldest[::-1]
+                    matched_timestamps = matched_current_to_oldest[::-1]
+                    match_errors = errors_current_to_oldest[::-1]
+            else:
+                history_start = history_end - history_length + 1
+                transition_stop = (
+                    history_end
+                    if session.target_mode == "torque"
+                    else history_end + 1
+                )
+                if not np.all(transition_ok[history_start:transition_stop]):
+                    rejected += 1
+                    continue
+                history_indices = np.arange(history_start, history_end + 1)
+                matched_timestamps = session.timestamp_s[history_indices]
+                match_errors = None
+
             # Match the official actuator-net semantics: measured velocity
             # history first, followed by controller tracking-error history.
             features = np.concatenate(
                 (
-                    actual[history_start : history_end + 1],
-                    velocity_error[history_start : history_end + 1],
+                    actual[history_indices],
+                    velocity_error[history_indices],
                 )
             )
             if session.target_mode == "torque":
                 assert session.tau is not None
+                # The measured-torque label and the 0 ms history sample are
+                # deliberately anchored to the same timestamped CSV row.
                 target = float(session.tau[history_end, side_id])
                 target_row = history_end
             else:
@@ -361,6 +484,11 @@ def build_examples(
             inputs.append(features.astype(np.float32, copy=False))
             targets.append(target)
             timestamps.append(float(session.timestamp_s[target_row]))
+            history_timestamps.append(matched_timestamps.astype(np.float64, copy=False))
+            if match_errors is not None:
+                history_match_errors.append(
+                    match_errors.astype(np.float64, copy=False)
+                )
             side_ids.append(side_id)
 
     if not inputs:
@@ -369,6 +497,12 @@ def build_examples(
         inputs=np.stack(inputs).astype(np.float32),
         targets=np.asarray(targets, dtype=np.float32).reshape(-1, 1),
         timestamps_s=np.asarray(timestamps, dtype=np.float64),
+        history_timestamps_s=np.stack(history_timestamps).astype(np.float64),
+        history_match_errors_s=(
+            np.stack(history_match_errors).astype(np.float64)
+            if timestamp_history
+            else None
+        ),
         side_ids=np.asarray(side_ids, dtype=np.int64),
         rejected_windows=rejected,
     )
@@ -390,4 +524,3 @@ def normalize_examples(
     inputs = (examples.inputs - normalization.input_mean) / normalization.input_std
     targets = (examples.targets - normalization.target_mean) / normalization.target_std
     return inputs.astype(np.float32), targets.astype(np.float32)
-

@@ -139,6 +139,16 @@ class WheelfootController:
             'zyx', self.imu_orientation_offset
         ).as_matrix()
 
+        # Read-only policy-observation telemetry for observation_monitor.py.
+        # This copies the final scaled/clipped 28-D vector after it has been
+        # constructed; it does not participate in policy or control logic.
+        self._observation_monitor_address = (
+            f"/tmp/tron1_policy_observation_{zero_gap_mode}.sock"
+        )
+        self._observation_monitor_socket = None
+        self._observation_monitor_next_probe = 0.0
+        self._observation_monitor_packet = struct.Struct("<4sQ32s28d")
+
         self.actuator_collection_start_time = None
         self.actuator_collection_center_q = None
         self.actuator_collection_leg_q = None
@@ -2008,6 +2018,7 @@ class WheelfootController:
             self.compute_observation()
             self.compute_encoder()
             self.compute_actions()
+            self.publish_policy_observation_snapshot()
             raw_policy_actions = np.asarray(self.actions, dtype=float).copy()
             if self.rl_type == "isaaclab":
                 raw_policy_actions = self.swap_positions(
@@ -2251,6 +2262,39 @@ class WheelfootController:
             self._zero_gap_socket.close()
             self._zero_gap_socket = None
             self._zero_gap_next_probe = now + 1.0
+
+    def publish_policy_observation_snapshot(self):
+        """Non-blockingly copy the exact 28-D policy observation to a monitor."""
+        observation = np.asarray(self.observations, dtype=float).reshape(-1)
+        if observation.size != 28 or not np.all(np.isfinite(observation)):
+            return
+
+        now = time.monotonic()
+        if self._observation_monitor_socket is None:
+            if now < self._observation_monitor_next_probe:
+                return
+            self._observation_monitor_socket = socket.socket(
+                socket.AF_UNIX,
+                socket.SOCK_DGRAM,
+            )
+            self._observation_monitor_socket.setblocking(False)
+
+        fsm = self.mode.encode("ascii", errors="replace")[:31]
+        packet = self._observation_monitor_packet.pack(
+            b"OBS1",
+            time.time_ns(),
+            fsm,
+            *observation.tolist(),
+        )
+        try:
+            self._observation_monitor_socket.sendto(
+                packet,
+                self._observation_monitor_address,
+            )
+        except OSError:
+            self._observation_monitor_socket.close()
+            self._observation_monitor_socket = None
+            self._observation_monitor_next_probe = now + 1.0
 
     def log_walk_diagnostic(self):
         """Buffer one policy-frame snapshot and flush the CSV batch every second."""
