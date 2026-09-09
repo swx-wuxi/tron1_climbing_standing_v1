@@ -33,6 +33,7 @@ class WheelfootController:
 
         # Load configuration settings from the YAML file
         self.load_config(self.config_file)
+        self.report_walk_wheel_excitation_config()
         
         # Load the ONNX model
         self.initialize_onnx_models()
@@ -134,7 +135,7 @@ class WheelfootController:
         # The high-rate CSV keeps only the requested command/response fields;
         # constant tau_ff/Kp/Kd values travel in the packet but are written
         # once to the session configuration CSV by zero_gap_monitor.py.
-        self._zero_gap_packet = struct.Struct("<4sQ32s66d")
+        self._zero_gap_packet = struct.Struct("<4sQ32s67d")
         self._zero_gap_imu_offset_rotation = R.from_euler(
             'zyx', self.imu_orientation_offset
         ).as_matrix()
@@ -188,6 +189,23 @@ class WheelfootController:
         ))
         logger.addHandler(handler)
         self.logger = logger
+
+    def report_walk_wheel_excitation_config(self):
+        """Report the effective WALK wheel-excitation settings once at startup."""
+        message = (
+            "WALK_WHEEL_EXCITATION_CONFIG | "
+            f"enabled={self.walk_wheel_excitation_enabled} | "
+            f"mode={self.walk_wheel_excitation_mode} | "
+            f"amplitude_rad_s={self.walk_wheel_excitation_amplitude:.3f} | "
+            f"frequency_hz={self.walk_wheel_excitation_frequency:.3f} | "
+            f"start_delay_s={self.walk_wheel_excitation_start_delay:.3f} | "
+            f"duration_s={self.walk_wheel_excitation_duration:.3f} | "
+            f"ramp_time_s={self.walk_wheel_excitation_ramp:.3f} | "
+            f"max_wheel_speed_rad_s="
+            f"{self.walk_wheel_excitation_speed_limit:.3f}"
+        )
+        self.logger.info(message)
+        print(f"*** {message} ***", flush=True)
 
     def setup_diagnostic_csv(self):
         """Prepare a stable, analysis-friendly CSV schema."""
@@ -409,6 +427,89 @@ class WheelfootController:
         self.wheel_hold_zero_speed_limit = abs(float(
             wheel_hold_cfg.get('zero_command_speed_limit', 6.0)
         ))
+
+        # Optional actuator-identification probe applied only to the final
+        # wheel velocity targets in WALK.  It is deliberately independent of
+        # the stand-up FSM and disabled by default.
+        excitation_cfg = config['PointfootCfg'].get(
+            'walk_wheel_excitation', {}
+        )
+        self.walk_wheel_excitation_enabled = bool(
+            excitation_cfg.get('enabled', False)
+        )
+        self.walk_wheel_excitation_mode = str(
+            excitation_cfg.get('mode', 'same')
+        ).strip().lower()
+        self.walk_wheel_excitation_amplitude = abs(float(
+            excitation_cfg.get('amplitude_rad_s', 0.5)
+        ))
+        self.walk_wheel_excitation_frequency = float(
+            excitation_cfg.get('frequency_hz', 0.5)
+        )
+        self.walk_wheel_excitation_start_delay = max(0.0, float(
+            excitation_cfg.get('start_delay_s', 5.0)
+        ))
+        self.walk_wheel_excitation_duration = float(
+            excitation_cfg.get('duration_s', 12.0)
+        )
+        self.walk_wheel_excitation_ramp = float(
+            excitation_cfg.get('ramp_time_s', 2.0)
+        )
+        self.walk_wheel_excitation_speed_limit = abs(float(
+            excitation_cfg.get('max_wheel_speed_rad_s', 7.0)
+        ))
+        allowed_excitation_modes = {'same', 'opposite', 'left', 'right'}
+        if self.walk_wheel_excitation_mode not in allowed_excitation_modes:
+            raise ValueError(
+                "walk_wheel_excitation.mode must be one of: "
+                "same, opposite, left, right"
+            )
+        allowed_excitation_frequencies = (0.5, 1.0, 2.0, 3.0, 5.0)
+        if not any(np.isclose(
+            self.walk_wheel_excitation_frequency, frequency
+        ) for frequency in allowed_excitation_frequencies):
+            raise ValueError(
+                "walk_wheel_excitation.frequency_hz must be one of: "
+                "0.5, 1, 2, 3, 5"
+            )
+        if (
+            not np.isfinite(self.walk_wheel_excitation_amplitude)
+            or self.walk_wheel_excitation_amplitude <= 0.0
+        ):
+            raise ValueError(
+                "walk_wheel_excitation.amplitude_rad_s must be positive"
+            )
+        if (
+            not np.isfinite(self.walk_wheel_excitation_duration)
+            or self.walk_wheel_excitation_duration <= 0.0
+        ):
+            raise ValueError(
+                "walk_wheel_excitation.duration_s must be positive"
+            )
+        if (
+            not np.isfinite(self.walk_wheel_excitation_speed_limit)
+            or self.walk_wheel_excitation_speed_limit <= 0.0
+        ):
+            raise ValueError(
+                "walk_wheel_excitation.max_wheel_speed_rad_s must be positive"
+            )
+        if (
+            not np.isfinite(self.walk_wheel_excitation_ramp)
+            or self.walk_wheel_excitation_ramp <= 0.0
+            or 2.0 * self.walk_wheel_excitation_ramp
+            > self.walk_wheel_excitation_duration
+        ):
+            raise ValueError(
+                "walk_wheel_excitation.ramp_time_s must be positive and "
+                "no greater than half of duration_s"
+            )
+        self.walk_wheel_excitation_start_time = None
+        self.walk_wheel_excitation_completed = False
+        self.walk_wheel_excitation_aborted = False
+        self.walk_wheel_excitation_last = np.zeros(2, dtype=float)
+        # Telemetry-only flag: true only for a cycle in which the WALK wheel
+        # excitation passed every safety check and reached robot_cmd.dq.
+        self.walk_wheel_excitation_applied = False
 
         self.prepare_duration = float(fsm_cfg.get('prepare_duration', 1.0))
         self.shift_duration = float(fsm_cfg.get('shift_duration', 2.0))
@@ -1404,6 +1505,114 @@ class WheelfootController:
 
         self.zero_pitch_comp_last_correction = correction
 
+    def apply_walk_wheel_excitation(self):
+        """Add one bounded, smoothly-windowed sine probe in WALK only."""
+        self.walk_wheel_excitation_last.fill(0.0)
+        if (
+            not self.walk_wheel_excitation_enabled
+            or self.mode != "WALK"
+            or self.walk_wheel_excitation_completed
+            or self.walk_wheel_excitation_aborted
+        ):
+            return
+
+        now = time.monotonic()
+        if self.walk_wheel_excitation_start_time is None:
+            self.walk_wheel_excitation_start_time = now
+
+        elapsed_since_walk = now - self.walk_wheel_excitation_start_time
+        if elapsed_since_walk < self.walk_wheel_excitation_start_delay:
+            return
+        elapsed = elapsed_since_walk - self.walk_wheel_excitation_start_delay
+        if elapsed >= self.walk_wheel_excitation_duration:
+            self.walk_wheel_excitation_completed = True
+            self.logger.info("WALK wheel excitation completed")
+            return
+
+        wheel_indices = self.get_wheel_indices()
+        if len(wheel_indices) != 2:
+            self.walk_wheel_excitation_aborted = True
+            self.logger.error(
+                "WALK wheel excitation disabled: expected two wheel joints"
+            )
+            return
+
+        actual_dq = np.asarray(
+            [self.robot_state_tmp.dq[index] for index in wheel_indices],
+            dtype=float,
+        )
+        tau_feedback = np.asarray(
+            [self.robot_state_tmp.tau[index] for index in wheel_indices],
+            dtype=float,
+        )
+        base_dq = np.asarray(
+            [self.robot_cmd.dq[index] for index in wheel_indices],
+            dtype=float,
+        )
+        pitch, pitch_rate = self.get_pitch_state()
+        finite_state = np.all(np.isfinite(np.concatenate((
+            actual_dq,
+            tau_feedback,
+            base_dq,
+            np.asarray([pitch, pitch_rate]),
+        ))))
+        speed_limit = self.walk_wheel_excitation_speed_limit
+        unsafe_reason = ""
+        if not finite_state:
+            unsafe_reason = "non-finite wheel/IMU state"
+        elif abs(pitch) > self.zero_pitch_comp_release_pitch:
+            unsafe_reason = "pitch limit exceeded"
+        elif abs(pitch_rate) > self.zero_pitch_comp_release_rate:
+            unsafe_reason = "pitch-rate limit exceeded"
+        elif np.max(np.abs(actual_dq)) > speed_limit:
+            unsafe_reason = "measured wheel speed limit exceeded"
+        elif np.max(np.abs(tau_feedback)) > self.wheel_joint_torque_limit:
+            unsafe_reason = "wheel torque limit exceeded"
+
+        ramp_in = self.smoothstep(
+            elapsed / self.walk_wheel_excitation_ramp
+        )
+        ramp_out = self.smoothstep(
+            (self.walk_wheel_excitation_duration - elapsed)
+            / self.walk_wheel_excitation_ramp
+        )
+        envelope = min(ramp_in, ramp_out)
+        sine = (
+            envelope
+            * self.walk_wheel_excitation_amplitude
+            * np.sin(
+                2.0 * np.pi
+                * self.walk_wheel_excitation_frequency
+                * elapsed
+            )
+        )
+        mode_signs = {
+            'same': np.asarray([1.0, 1.0]),
+            'opposite': np.asarray([1.0, -1.0]),
+            'left': np.asarray([1.0, 0.0]),
+            'right': np.asarray([0.0, 1.0]),
+        }
+        excitation = sine * mode_signs[self.walk_wheel_excitation_mode]
+        candidate_dq = base_dq + excitation
+        if not unsafe_reason and np.max(np.abs(candidate_dq)) > speed_limit:
+            unsafe_reason = "commanded wheel speed limit exceeded"
+
+        if unsafe_reason:
+            self.walk_wheel_excitation_aborted = True
+            self.logger.error(
+                f"WALK wheel excitation removed: {unsafe_reason}"
+            )
+            return
+
+        action_scale = self.control_cfg['action_scale_vel']
+        for index, velocity in zip(wheel_indices, candidate_dq):
+            self.robot_cmd.dq[index] = float(velocity)
+            # Keep the policy's action history consistent with the command
+            # that is actually sent to the wheel actuator.
+            self.last_actions[index] = float(velocity) / action_scale
+        self.walk_wheel_excitation_last = excitation
+        self.walk_wheel_excitation_applied = True
+
     def transition_standup_phase(self, new_mode, reason=""):
         """Every phase starts from the current measured pose, not an old reference."""
         old_mode = self.mode
@@ -2157,6 +2366,9 @@ class WheelfootController:
         # Final zero-command wheel residual: translation/yaw hold and neutral
         # speed cap.  A nonzero operator command bypasses this path entirely.
         self.apply_zero_command_wheel_hold()
+        # Opt-in actuator-identification residual.  The guard inside the
+        # function prevents it from running during stand-up or RL blending.
+        self.apply_walk_wheel_excitation()
         if policy_updated:
             self.log_walk_diagnostic()
 
@@ -2252,6 +2464,7 @@ class WheelfootController:
             *tau_feedback,
             pitch,
             gyro_y,
+            float(self.walk_wheel_excitation_applied),
             *tau_ff,
             *kp,
             *kd,
@@ -2620,6 +2833,9 @@ class WheelfootController:
         self._last_update_time = update_time
         self.robot_state_tmp = copy.deepcopy(self.robot_state)
         self.imu_data_tmp = copy.deepcopy(self.imu_data)
+        # Cleared every control cycle; apply_walk_wheel_excitation() sets it
+        # only after the excitation has actually been added to robot_cmd.dq.
+        self.walk_wheel_excitation_applied = False
 
         if self.mode == "KNEEL_HOLD":
             self.handle_kneel_hold()

@@ -4,3 +4,4 @@ saved-policies
 controllers/model/WF_TRON1A/policy/isaacgym
 zero_gap_logs
 outputs
+input_raw_data

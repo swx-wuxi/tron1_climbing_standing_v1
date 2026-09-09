@@ -30,7 +30,23 @@ PointfootCfg:
     action_scale_vel: 0.5
     decimation: 10
     user_torque_limit: 80
+  #################### （1）新增轮子激励 ######################
+  # Optional wheel actuator-identification probe.  It is added to the final
+  # policy wheel dq target only in WALK and runs once per controller session.
+  # Keep disabled until the selected mode/frequency has passed simulation.
+  walk_wheel_excitation:
+    enabled: false
+    mode: same  # same | opposite | left | right
+    amplitude_rad_s: 0.5
+    frequency_hz: 0.5  # supported: 0.5, 1, 2, 3, 5
+    start_delay_s: 5.0
+    duration_s: 12.0
+    ramp_time_s: 2.0
+    max_wheel_speed_rad_s: 9.0
 
+  ##########################################
+
+  #################### （2）新增执行器响应实验 （数采） ######################
   # Opt-in actuator-response experiment.  Every excitation is disabled and
   # all physical amplitudes/frequencies are inert placeholders until they are
   # validated first in simulation and then for the specific supported robot.
@@ -68,7 +84,7 @@ PointfootCfg:
       max_tilt_deg: 0.0
       joint_limit_margin_rad: 0.10
       tracking_grace_s: 0.25
-
+  ########################################
   normalization:
     clip_scales:
       clip_observations: 100.0

@@ -50,6 +50,7 @@ RAW_NUMERIC_FIELDS = tuple(
 RAW_FIELDS = (
     "timestamp_ns",
     *RAW_NUMERIC_FIELDS,
+    "wheel_excitation_active",
     "fsm",
 )
 LEG_INDICES = (0, 1, 2, 4, 5, 6)
@@ -76,7 +77,7 @@ CONFIG_FIELDS = (
     "fsm_at_log_start",
     *CONFIG_NUMERIC_FIELDS,
 )
-PACKET = struct.Struct("<4sQ32s66d")
+PACKET = struct.Struct("<4sQ32s67d")
 
 
 def parse_args():
@@ -145,9 +146,15 @@ def format_values(values):
 def make_raw_row(telemetry):
     timestamp_ns, fsm, values, _ = telemetry
     raw_values = values[:len(RAW_NUMERIC_FIELDS)]
+    excitation_active = int(bool(values[len(RAW_NUMERIC_FIELDS)]))
     return dict(zip(
         RAW_FIELDS,
-        [str(timestamp_ns), *format_values(raw_values), fsm],
+        [
+            str(timestamp_ns),
+            *format_values(raw_values),
+            str(excitation_active),
+            fsm,
+        ],
     ))
 
 
@@ -167,7 +174,7 @@ def make_processed_row(telemetry):
 
 def make_config_row(mode, telemetry):
     timestamp_ns, fsm, values, _ = telemetry
-    config_values = values[len(RAW_NUMERIC_FIELDS):]
+    config_values = values[len(RAW_NUMERIC_FIELDS) + 1:]
     return dict(zip(
         CONFIG_FIELDS,
         [str(timestamp_ns), mode, fsm, *format_values(config_values)],
@@ -181,6 +188,7 @@ def print_row(row):
         f"{row['wheel_r_dq_des_rad_s']}] rad/s "
         f"wheel_dq=[{row['wheel_l_dq_rad_s']}, "
         f"{row['wheel_r_dq_rad_s']}] rad/s "
+        f"excitation_active={row['wheel_excitation_active']} "
         f"pitch={row['pitch_deg']} deg gyro_y={row['gyro_y_rad_s']} rad/s",
         flush=True,
     )

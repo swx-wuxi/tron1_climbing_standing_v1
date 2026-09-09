@@ -752,7 +752,7 @@ if __name__ == '__main__':
             "tron1-rl-deploy-python",
             "actuator_network",
             "outputs",
-            "best_wheel_actuator_v2.pt",
+            "best_wheel_actuator_sinv2.pt",
         )
     if args.reference_actuator_network:
         if not robot_type.startswith("WF"):

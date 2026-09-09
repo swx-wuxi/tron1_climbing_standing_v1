@@ -33,8 +33,8 @@ from actuator_model import make_model
 
 # All first-version experiment settings are intentionally centralized here.
 DEFAULT_CSV = Path(
-    "/home/air/swx_tron1/tron1-rl-deploy-python/input_raw_realdata"
-    "/Raw_v1.csv"
+    "/home/air/swx_tron1/tron1-rl-deploy-python/input_raw_data"
+    "/real_sinwave_v3.csv"
 )
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 TARGET_MODE = "auto"  # auto selects torque when both wheel torque fields are usable
@@ -271,7 +271,7 @@ def main() -> int:
     criterion = nn.MSELoss()
 
     checkpoint_path = (
-        args.output_dir / f"best_wheel_actuator_{args.history_version}.pt"
+        args.output_dir / f"best_wheel_actuator_sinv3.pt"
     )
     best_val_loss = float("inf")
     epochs_without_improvement = 0
