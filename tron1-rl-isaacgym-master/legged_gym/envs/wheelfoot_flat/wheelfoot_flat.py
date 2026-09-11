@@ -1,8 +1,10 @@
 from legged_gym import LEGGED_GYM_ROOT_DIR, envs
 from time import time
 from warnings import WarningMessage
+import importlib.util
 import numpy as np
 import os
+from pathlib import Path
 
 from isaacgym.torch_utils import *
 from isaacgym import gymtorch, gymapi, gymutil
@@ -39,6 +41,7 @@ class BipedWF(BaseTask):
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
         self._init_buffers()
+        self._init_wheel_actuator_network()
         self._prepare_reward_function()
         self.init_done = True
         # Start training from the same fully initialized state used after every
@@ -451,6 +454,51 @@ class BipedWF(BaseTask):
     def reset_idx(self, env_ids):
         if len(env_ids) == 0:
             return
+        completed_persistent_ids = env_ids[
+            self.persistent_zero_cmd[env_ids]
+            & self.curriculum_episode_valid[env_ids]
+        ]
+        persistent_zero_metrics = None
+        if len(completed_persistent_ids) > 0:
+            sample_count = torch.clamp(
+                self.persistent_zero_sample_count[
+                    completed_persistent_ids
+                ].sum(),
+                min=1.0,
+            )
+            persistent_zero_metrics = {
+                "persistent_zero_rms_yaw_rate": torch.sqrt(
+                    self.persistent_zero_yaw_rate_sq_sum[
+                        completed_persistent_ids
+                    ].sum()
+                    / sample_count
+                ),
+                "persistent_zero_rms_pitch_rate": torch.sqrt(
+                    self.persistent_zero_pitch_rate_sq_sum[
+                        completed_persistent_ids
+                    ].sum()
+                    / sample_count
+                ),
+                "persistent_zero_mean_abs_wheel_action_l": (
+                    self.persistent_zero_wheel_action_abs_sum[
+                        completed_persistent_ids, 0
+                    ].sum()
+                    / sample_count
+                ),
+                "persistent_zero_mean_abs_wheel_action_r": (
+                    self.persistent_zero_wheel_action_abs_sum[
+                        completed_persistent_ids, 1
+                    ].sum()
+                    / sample_count
+                ),
+                "persistent_zero_mean_abs_accumulated_yaw": torch.mean(
+                    torch.abs(
+                        self.persistent_zero_accumulated_yaw[
+                            completed_persistent_ids
+                        ]
+                    )
+                ),
+            }
         # update curriculum
         if self.cfg.terrain.curriculum:
             self._update_terrain_curriculum(env_ids)
@@ -484,6 +532,10 @@ class BipedWF(BaseTask):
         self.fail_buf[env_ids] = 0
         self.action_fifo[env_ids] = 0
         self.dof_pos_int[env_ids] = 0
+        if hasattr(self, "wheel_actuator_history_count"):
+            self.wheel_actuator_dq_history[env_ids] = 0.0
+            self.wheel_actuator_error_history[env_ids] = 0.0
+            self.wheel_actuator_history_count[env_ids] = 0
         self.wheel_contact[env_ids] = False
         self.reflection_active[env_ids] = False
         self.reflection_reward_active[env_ids] = False
@@ -513,6 +565,11 @@ class BipedWF(BaseTask):
         self.scene6_descent_complete_latched[env_ids] = False
         self.scene6_centerline_bias[env_ids] = 0.0
         self.scene6_heading_bias[env_ids] = 0.0
+        self.persistent_zero_sample_count[env_ids] = 0.0
+        self.persistent_zero_yaw_rate_sq_sum[env_ids] = 0.0
+        self.persistent_zero_pitch_rate_sq_sum[env_ids] = 0.0
+        self.persistent_zero_wheel_action_abs_sum[env_ids] = 0.0
+        self.persistent_zero_accumulated_yaw[env_ids] = 0.0
         self.obs_history[env_ids] = 0
         obs_buf, _ = self.compute_group_observations()
         self.obs_history[env_ids] = obs_buf[env_ids].repeat(
@@ -526,6 +583,8 @@ class BipedWF(BaseTask):
                 / self.max_episode_length_s
             )
             self.episode_sums[key][env_ids] = 0.0
+        if persistent_zero_metrics is not None:
+            self.extras["episode"].update(persistent_zero_metrics)
         # log additional curriculum info
         if self.cfg.terrain.curriculum:
             self.extras["episode"]["group_terrain_level"] = torch.mean(
@@ -635,6 +694,167 @@ class BipedWF(BaseTask):
         
     def _action_clip(self, actions):
         self.actions = actions
+
+    def _init_wheel_actuator_network(self):
+        """Load the frozen real-wheel torque model used by the training physics."""
+        checkpoint_path = (
+            Path(LEGGED_GYM_ROOT_DIR).resolve().parent
+            / "tron1-rl-deploy-python"
+            / "actuator_network"
+            / "outputs"
+            / "best_wheel_actuator_sinv2.pt"
+        )
+        self.wheel_actuator_checkpoint_path = checkpoint_path
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"wheel actuator checkpoint does not exist: {checkpoint_path}"
+            )
+
+        checkpoint = torch.load(
+            checkpoint_path, map_location=self.device, weights_only=True
+        )
+        if checkpoint.get("target_mode") != "torque":
+            raise ValueError("wheel actuator checkpoint must predict torque")
+        if checkpoint.get("history_order") != "current_to_oldest":
+            raise ValueError(
+                "wheel actuator checkpoint history must be current_to_oldest"
+            )
+
+        model_path = checkpoint_path.parent.parent / "actuator_model.py"
+        spec = importlib.util.spec_from_file_location(
+            "tron1_isaac_wheel_actuator_model", model_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load actuator model definition: {model_path}")
+        model_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(model_module)
+        self.wheel_actuator_model = model_module.make_model(
+            int(checkpoint["input_dim"]), checkpoint["hidden_sizes"]
+        ).to(self.device)
+        self.wheel_actuator_model.load_state_dict(checkpoint["model_state_dict"])
+        self.wheel_actuator_model.eval()
+        self.wheel_actuator_model.requires_grad_(False)
+
+        self.wheel_actuator_input_mean = checkpoint["input_mean"].to(
+            device=self.device, dtype=torch.float
+        )
+        self.wheel_actuator_input_std = checkpoint["input_std"].to(
+            device=self.device, dtype=torch.float
+        )
+        self.wheel_actuator_target_mean = checkpoint["target_mean"].to(
+            device=self.device, dtype=torch.float
+        )
+        self.wheel_actuator_target_std = checkpoint["target_std"].to(
+            device=self.device, dtype=torch.float
+        )
+
+        offsets_s = np.asarray(checkpoint["history_offsets_s"], dtype=np.float64)
+        history_length = int(checkpoint["history_length"])
+        if offsets_s.shape != (history_length,):
+            raise ValueError("wheel actuator history metadata is inconsistent")
+        history_steps_float = offsets_s / float(self.sim_params.dt)
+        history_steps = np.rint(history_steps_float).astype(np.int64)
+        if not np.allclose(history_steps_float, history_steps, atol=1.0e-6):
+            raise ValueError(
+                "Isaac simulation dt cannot represent wheel actuator history "
+                f"offsets exactly: dt={self.sim_params.dt}, offsets={offsets_s.tolist()}"
+            )
+        if int(checkpoint["input_dim"]) != 2 * history_length:
+            raise ValueError("wheel actuator input_dim must equal 2 * history_length")
+
+        wheel_names = ("wheel_L_Joint", "wheel_R_Joint")
+        missing_wheels = [name for name in wheel_names if name not in self.dof_names]
+        if missing_wheels:
+            raise ValueError(
+                "wheel actuator checkpoint requires joints: "
+                + ", ".join(missing_wheels)
+            )
+        self.wheel_actuator_dof_indices = torch.tensor(
+            [self.dof_names.index(name) for name in wheel_names],
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.wheel_actuator_history_steps = torch.tensor(
+            history_steps, dtype=torch.long, device=self.device
+        )
+        history_buffer_length = int(history_steps.max()) + 1
+        history_shape = (self.num_envs, len(wheel_names), history_buffer_length)
+        self.wheel_actuator_dq_history = torch.zeros(
+            history_shape, dtype=torch.float, device=self.device
+        )
+        self.wheel_actuator_error_history = torch.zeros_like(
+            self.wheel_actuator_dq_history
+        )
+        self.wheel_actuator_history_count = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.wheel_actuator_history_required = history_buffer_length
+        print(
+            "Loaded frozen sinv2 wheel actuator network for Isaac Gym: "
+            f"{checkpoint_path} (history steps={history_steps.tolist()})"
+        )
+
+    def _compute_wheel_actuator_torques(self, desired_dq):
+        """Predict both real-wheel torques in one batched GPU inference."""
+        actual_dq = self.dof_vel[:, self.wheel_actuator_dof_indices]
+        tracking_error = desired_dq - actual_dq
+        # A reset has no preceding actuator history. Seed the complete history
+        # with the first measured state/error so the learned actuator is used
+        # immediately instead of temporarily falling back to ideal wheel PD.
+        uninitialized = (
+            self.wheel_actuator_history_count == 0
+        ).view(-1, 1, 1)
+        self.wheel_actuator_dq_history = torch.where(
+            uninitialized,
+            actual_dq.unsqueeze(-1).expand_as(
+                self.wheel_actuator_dq_history
+            ),
+            self.wheel_actuator_dq_history,
+        )
+        self.wheel_actuator_error_history = torch.where(
+            uninitialized,
+            tracking_error.unsqueeze(-1).expand_as(
+                self.wheel_actuator_error_history
+            ),
+            self.wheel_actuator_error_history,
+        )
+        self.wheel_actuator_dq_history = torch.cat(
+            (
+                actual_dq.unsqueeze(-1),
+                self.wheel_actuator_dq_history[:, :, :-1],
+            ),
+            dim=-1,
+        )
+        self.wheel_actuator_error_history = torch.cat(
+            (
+                tracking_error.unsqueeze(-1),
+                self.wheel_actuator_error_history[:, :, :-1],
+            ),
+            dim=-1,
+        )
+        self.wheel_actuator_history_count.add_(1).clamp_(
+            max=self.wheel_actuator_history_required
+        )
+
+        sampled_dq = self.wheel_actuator_dq_history.index_select(
+            2, self.wheel_actuator_history_steps
+        )
+        sampled_error = self.wheel_actuator_error_history.index_select(
+            2, self.wheel_actuator_history_steps
+        )
+        features = torch.cat((sampled_dq, sampled_error), dim=-1).reshape(
+            -1, self.wheel_actuator_input_mean.numel()
+        )
+        normalized_features = (
+            features - self.wheel_actuator_input_mean
+        ) / self.wheel_actuator_input_std
+        with torch.no_grad():
+            normalized_torque = self.wheel_actuator_model(normalized_features)
+        predicted_torque = (
+            normalized_torque * self.wheel_actuator_target_std
+            + self.wheel_actuator_target_mean
+        ).reshape(self.num_envs, 2)
+        return predicted_torque
         
     def _compute_torques(self, actions):
         pos_action = (
@@ -660,7 +880,20 @@ class BipedWF(BaseTask):
         # pd controller
         torques = self.p_gains * (pos_action + self.default_dof_pos - self.dof_pos) + self.d_gains * (vel_action - self.dof_vel)
         torques = torch.clip(torques, -self.torque_limits, self.torque_limits )  # torque limit is lower than the torque-requiring lower bound
-        return torques * self.torques_scale #notice that even send torque at torque limit , real motor may generate bigger torque that limit!!!!!!!!!!
+        scaled_torques = torques * self.torques_scale
+
+        wheel_torques = self._compute_wheel_actuator_torques(
+            vel_action[:, self.wheel_actuator_dof_indices]
+        )
+        wheel_torque_limits = self.torque_limits[
+            self.wheel_actuator_dof_indices
+        ].unsqueeze(0)
+        wheel_torques = torch.maximum(
+            torch.minimum(wheel_torques, wheel_torque_limits),
+            -wheel_torque_limits,
+        )
+        scaled_torques[:, self.wheel_actuator_dof_indices] = wheel_torques
+        return scaled_torques #notice that even send torque at torque limit , real motor may generate bigger torque that limit!!!!!!!!!!
 
     def post_physics_step(self):
         super().post_physics_step()
@@ -928,6 +1161,28 @@ class BipedWF(BaseTask):
             dim=-1,
         )
         return obs_buf, critic_obs_buf
+
+    def _update_persistent_zero_metrics(self):
+        """Accumulate lightweight diagnostics for persistent-zero episodes."""
+        active = self.persistent_zero_cmd.to(dtype=torch.float)
+        self.persistent_zero_sample_count += active
+        self.persistent_zero_yaw_rate_sq_sum += (
+            torch.square(self.base_ang_vel[:, 2]) * active
+        )
+        self.persistent_zero_pitch_rate_sq_sum += (
+            torch.square(self.base_ang_vel[:, 1]) * active
+        )
+        wheel_actions = self.actions.index_select(
+            1, self.wheel_actuator_dof_indices
+        )
+        self.persistent_zero_wheel_action_abs_sum += (
+            torch.abs(wheel_actions) * active.unsqueeze(1)
+        )
+        # World-frame z angular velocity integrates directly to the monitored
+        # signed yaw change for the short, upright standstill episodes.
+        self.persistent_zero_accumulated_yaw += (
+            self.root_states[:, 12] * self.dt * active
+        )
     
     def _post_physics_step_callback(self):
         """Callback called before computing terminations, rewards, and observations
@@ -957,7 +1212,9 @@ class BipedWF(BaseTask):
             heading = torch.atan2(forward[:, 1], forward[:, 0])
             self.commands[:, 2] = 0.1 * wrap_to_pi(self.commands[:, 3] - heading)
         self.commands[self.stair_course_env_mask, 1:3] = 0.0
+        self.commands[self.persistent_zero_cmd, 0:3] = 0.0
         self._update_scene6_directional_bias()
+        self._update_persistent_zero_metrics()
 
         if self.cfg.terrain.measure_heights or self.cfg.terrain.critic_measure_heights:
             self.measured_heights = self._get_heights()
@@ -1403,6 +1660,26 @@ class BipedWF(BaseTask):
         if len(env_ids) == 0:
             return env_ids
 
+        if episode_reset:
+            self.persistent_zero_cmd[env_ids] = False
+            flat_reset_ids = env_ids[self.flat_env_mask[env_ids]]
+            if len(flat_reset_ids) > 0:
+                persistent_probability = float(
+                    self.cfg.commands.persistent_zero_command_probability
+                )
+                persistent_ids = flat_reset_ids[
+                    torch.rand(
+                        len(flat_reset_ids), device=self.device
+                    ) < persistent_probability
+                ]
+                self.persistent_zero_cmd[persistent_ids] = True
+
+        persistent_ids = env_ids[self.persistent_zero_cmd[env_ids]]
+        self.commands[persistent_ids, 0:3] = 0.0
+        env_ids = env_ids[~self.persistent_zero_cmd[env_ids]]
+        if len(env_ids) == 0:
+            return env_ids
+
         self.commands[env_ids, 0] = (
             self.command_ranges["lin_vel_x"][env_ids, 1]
             - self.command_ranges["lin_vel_x"][env_ids, 0]
@@ -1674,6 +1951,25 @@ class BipedWF(BaseTask):
         if getattr(self.cfg.terrain, "scene6_enabled", False):
             self.stair_course_env_mask[self.stair_course_idx] = True
             self.stair_env_mask[self.stair_course_idx] = True
+
+        self.flat_env_mask = torch.zeros_like(self.stair_env_mask)
+        self.flat_env_mask[self.smooth_slope_idx] = True
+        self.persistent_zero_cmd = torch.zeros_like(self.stair_env_mask)
+        self.persistent_zero_sample_count = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device
+        )
+        self.persistent_zero_yaw_rate_sq_sum = torch.zeros_like(
+            self.persistent_zero_sample_count
+        )
+        self.persistent_zero_pitch_rate_sq_sum = torch.zeros_like(
+            self.persistent_zero_sample_count
+        )
+        self.persistent_zero_wheel_action_abs_sum = torch.zeros(
+            self.num_envs, 2, dtype=torch.float, device=self.device
+        )
+        self.persistent_zero_accumulated_yaw = torch.zeros_like(
+            self.persistent_zero_sample_count
+        )
 
         self.wheel_axis_local = torch.zeros_like(self.foot_positions)
         self.wheel_axis_local[:, :, 1] = 1.0

@@ -167,6 +167,10 @@ class BipedCfgWF(BaseConfig):
         stair_full_command_ang_vel_yaw = [-0.80, 0.80]
         stair_full_command_standstill_probability = 0.10
         full_command_standstill_probability = 0.05
+        # At each episode reset, this share of flat-terrain environments is
+        # assigned a zero command for the complete episode. Periodic command
+        # resampling must not change those commands.
+        persistent_zero_command_probability = 0.30
         full_command_in_place_turn_probability = 0.05
         full_command_in_place_turn_min_abs_yaw = 0.30
         stair_command_standstill_probability = 0.10
@@ -536,7 +540,7 @@ class BipedCfgPPOWF(BaseConfig):
         entropy_coef = 0.01
         num_learning_epochs = 5
         num_mini_batches = 4  # mini batch size = num_envs*nsteps / nminibatches
-        learning_rate = 2.0e-4  # conservative plane -> S21 stair fine-tuning
+        learning_rate = 5.0e-5  # ideal-actuator checkpoint -> learned actuator fine-tuning
         schedule = "adaptive"  # could be adaptive, fixed
         gamma = 0.99
         lam = 0.95
@@ -553,7 +557,7 @@ class BipedCfgPPOWF(BaseConfig):
         policy_class_name = "ActorCritic"
         algorithm_class_name = "PPO"
         num_steps_per_env = 24  # per iteration
-        max_iterations = 1500
+        max_iterations = 3000
 
         # logging
         logger = "tensorboard"
@@ -561,16 +565,13 @@ class BipedCfgPPOWF(BaseConfig):
         wandb_project = "legged_gym_WF"
         save_interval = 500  # check for potential saves every this many iterations
         experiment_name = "WF_TRON1A"
-        run_name = "S4_zero_command_drift_continue"
-
-        resume = True
-        # load_run = "Aug12_11-25-54_S2_stair_from_model3000"
-        # checkpoint = 20000
-        # resume_path = "/home/pc/tron1-rl-isaacgym-master/logs/wheelfoot_flat/WF_TRON1A/Aug12_11-25-54_S2_stair_from_model3000/model_22000.pt"
+        run_name = "S4_real_actuator_persistent_zero_finetune"
         
-        load_run = "Aug28_11-01-36_S3_zero_command_drift_fix"
-        checkpoint = 21500
-        resume_path = "/home/pc/tron1-rl-isaacgym-master/logs/wheelfoot_flat/WF_TRON1A/Aug28_11-01-36_S3_zero_command_drift_fix/model_21500.pt"
+        resume = True
+        load_run = "Aug12_11-25-54_S2_stair_from_model3000"
+        checkpoint = 20000
+        resume_path = "/home/pc/tron1-rl-isaacgym-master/logs/wheelfoot_flat/WF_TRON1A/Aug12_11-25-54_S2_stair_from_model3000/model_20000.pt"
+        load_optimizer = False
 
         resume_iteration = 3000   # 66500
         # Keep the checkpoint network/optimizer loading path unchanged.

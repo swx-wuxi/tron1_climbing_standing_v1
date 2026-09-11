@@ -247,9 +247,16 @@ class OnPolicyRunner:
 
         ep_string = f""
         if locs["ep_infos"]:
-            for key in locs["ep_infos"][0]:
+            episode_keys = dict.fromkeys(
+                key
+                for ep_info in locs["ep_infos"]
+                for key in ep_info
+            )
+            for key in episode_keys:
                 infotensor = torch.tensor([], device=self.device)
                 for ep_info in locs["ep_infos"]:
+                    if key not in ep_info:
+                        continue
                     # handle scalar and zero dimensional tensor infos
                     if not isinstance(ep_info[key], torch.Tensor):
                         ep_info[key] = torch.Tensor([ep_info[key]])

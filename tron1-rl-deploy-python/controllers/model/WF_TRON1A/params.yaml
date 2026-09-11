@@ -35,7 +35,7 @@ PointfootCfg:
   # policy wheel dq target only in WALK and runs once per controller session.
   # Keep disabled until the selected mode/frequency has passed simulation.
   walk_wheel_excitation:
-    enabled: false
+    enabled: false    # 真机原始采集数据，要开，仿真测试关闭
     mode: same  # same | opposite | left | right
     amplitude_rad_s: 0.5
     frequency_hz: 0.5  # supported: 0.5, 1, 2, 3, 5
