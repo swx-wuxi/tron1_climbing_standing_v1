@@ -106,7 +106,9 @@ PointfootCfg:
   # Merge under PointfootCfg. This is a partial YAML block, not a replacement file.
   stand_mode:
     kneel_hold_duration: 0.20
-    rl_handoff_blend_duration: 0.20
+    rl_handoff_blend_duration: 0.40
+    rl_handoff_wheel_blend_duration: 0.20
+    rl_handoff_lateral_guard_duration: 0.30
     support_pitch_deg: 20.0
     target_pitch_deg: 7.5
 

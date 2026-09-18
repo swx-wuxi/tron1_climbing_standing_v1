@@ -335,6 +335,18 @@ class WheelfootController:
         self.rl_handoff_blend_duration = float(
             stand_cfg.get('rl_handoff_blend_duration', 0.20)
         )
+        self.rl_handoff_wheel_blend_duration = float(
+            stand_cfg.get(
+                'rl_handoff_wheel_blend_duration',
+                self.rl_handoff_blend_duration,
+            )
+        )
+        self.rl_handoff_lateral_guard_duration = float(
+            stand_cfg.get(
+                'rl_handoff_lateral_guard_duration',
+                self.rl_handoff_blend_duration,
+            )
+        )
 
         # ---- Fixed-kneel stand-up FSM parameters ----
         # These are the small subset required by the colleague's stand-up path.
@@ -1677,23 +1689,62 @@ class WheelfootController:
             return
 
         elapsed = self.loop_count / self.loop_frequency
-        progress = float(np.clip(
+        leg_progress = float(np.clip(
             elapsed / max(self.rl_handoff_blend_duration, 1e-6),
             0.0,
             1.0,
         ))
-        alpha = self.smoothstep(progress)
+        leg_alpha = self.smoothstep(leg_progress)
+        wheel_progress = float(np.clip(
+            elapsed / max(self.rl_handoff_wheel_blend_duration, 1e-6),
+            0.0,
+            1.0,
+        ))
+        wheel_alpha = self.smoothstep(wheel_progress)
 
         for i in self.get_leg_indices():
             self.robot_cmd.q[i] = (
-                (1.0 - alpha) * self.rl_handoff_start_q[i]
-                + alpha * self.robot_cmd.q[i]
+                (1.0 - leg_alpha) * self.rl_handoff_start_q[i]
+                + leg_alpha * self.robot_cmd.q[i]
+            )
+
+        # During this short transition, keep the lateral component inherited
+        # from the FSM instead of letting a first policy sample inject a large
+        # left/right step.  The antisymmetric component (the normal mirrored
+        # leg extension) remains fully controlled by the blended policy.
+        if elapsed < self.rl_handoff_lateral_guard_duration:
+            for left_name, right_name in (
+                ("abad_L_Joint", "abad_R_Joint"),
+                ("hip_L_Joint", "hip_R_Joint"),
+                ("knee_L_Joint", "knee_R_Joint"),
+            ):
+                left = self.joint_names.index(left_name)
+                right = self.joint_names.index(right_name)
+                inherited_lateral = 0.5 * (
+                    self.rl_handoff_start_q[left]
+                    + self.rl_handoff_start_q[right]
+                )
+                mirrored_extension = 0.5 * (
+                    self.robot_cmd.q[left] - self.robot_cmd.q[right]
+                )
+                self.robot_cmd.q[left] = inherited_lateral + mirrored_extension
+                self.robot_cmd.q[right] = inherited_lateral - mirrored_extension
+
+        for i in self.get_leg_indices():
+            # Keep the action-history observation consistent with the leg
+            # target actually sent during the handoff, just as we already do
+            # for wheel velocity below.  Feeding the unblended policy action
+            # back while executing a blended target makes the next policy
+            # samples over-correct from a state transition that never occurred.
+            self.last_actions[i] = (
+                (self.robot_cmd.q[i] - self.init_joint_angles[i])
+                / self.control_cfg["action_scale_pos"]
             )
 
         for i in self.get_wheel_indices():
             applied_dq = (
-                (1.0 - alpha) * self.rl_handoff_start_dq[i]
-                + alpha * self.robot_cmd.dq[i]
+                (1.0 - wheel_alpha) * self.rl_handoff_start_dq[i]
+                + wheel_alpha * self.robot_cmd.dq[i]
             )
             self.robot_cmd.dq[i] = applied_dq
             # The policy history must describe the wheel action that was
@@ -1702,7 +1753,12 @@ class WheelfootController:
                 applied_dq / self.control_cfg["action_scale_vel"]
             )
 
-        if progress >= 1.0:
+        elapsed = self.loop_count / self.loop_frequency
+        if elapsed >= max(
+            self.rl_handoff_blend_duration,
+            self.rl_handoff_wheel_blend_duration,
+            self.rl_handoff_lateral_guard_duration,
+        ):
             self.rl_handoff_blend_active = False
 
     ########### 在机器人已经“足够稳定、但还没完全走到硬编码末端”时，把控制权交给 RL。########
